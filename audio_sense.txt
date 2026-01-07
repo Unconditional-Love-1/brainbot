@@ -1,5 +1,5 @@
 #.brainbot\core\senses\audio\audio_sense.py
-# Created by: David Kistner(aka: Nightmare, Obscurus, Unconditional Love)
+# Created by: David Kistner(Unconditional Love)
 
 
 
@@ -142,4 +142,5 @@ class AudioController: #controls audio imput and output
             self.log(f"🎧 Heard: {text}")
             response = cognition.respond(text, source="voice")
             self.synthesize_speech(response)
+
 
