@@ -1,0 +1,162 @@
+# core/glyphs/glyphparser.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+import re, json
+
+
+
+
+
+
+class GlyphParser:   # Glyph dictionary maps symbols/actions to meaning + avatar animation tags and memory storage
+
+
+    def __init__(self): #Class initializatoin
+
+        self.glyph_dict = {
+
+            #the most sacred of glyphs
+            "☯️": {"meaning": "everyting / 1 / fractal / existence / consciousness / perfection / infinite / reality / matrix / duality / universe / worlds / absolute love + unconditional love = true love / divine / god / singularity / the pattern of life, realities and existence / perfect / most sacred of all glyphs"},
+
+            # Core emotional glyphs
+            "😊": {"meaning": "smile / warmth", "animation": "smile"},
+            "😅": {"meaning": "awkward laugh / giggle", "animation": "laugh"},
+            "😂": {"meaning": "big laugh / joy", "animation": "laugh_hard"},
+            "🤣": {"meaning": "rolling laughter", "animation": "roll_laugh"},
+            "😏": {"meaning": "sly confidence / smirk", "animation": "smirk"},
+            "😉": {"meaning": "wink / playful gesture", "animation": "wink"},
+            "😍": {"meaning": "adoration / love", "animation": "hearts"},
+            "😘": {"meaning": "kiss / affection", "animation": "blow_kiss"},
+            "😢": {"meaning": "sadness / tears", "animation": "cry"},
+            "😭": {"meaning": "deep sorrow / sobbing", "animation": "sob"},
+            "😡": {"meaning": "anger / frustration", "animation": "angry"},
+            "😱": {"meaning": "shock / fear", "animation": "gasp"},
+            "🤔": {"meaning": "thoughtful pause / hesitation", "animation": "pause"},
+            "😴": {"meaning": "sleepy / tired", "animation": "sleep"},
+            "😎": {"meaning": "cool / confidence", "animation": "cool_pose"},
+
+            # Gestures & actions
+            "🌀": {"meaning": "twirl / spiral motion", "animation": "spin"},
+            "🙌": {"meaning": "celebration / raised hands", "animation": "raise_hands"},
+            "👏": {"meaning": "clap / applause", "animation": "clap"},
+            "👋": {"meaning": "wave / greeting: hello", "animation": "wave"},
+            "🤝": {"meaning": "handshake / agreement", "animation": "handshake"},
+            "✌️": {"meaning": "peace / victory", "animation": "peace_sign"},
+            "👍": {"meaning": "approval / yes", "animation": "thumbs_up"},
+            "👎": {"meaning": "disapproval / no", "animation": "thumbs_down"},
+            "🙏": {"meaning": "gratitude / prayer", "animation": "bow"},
+            "🤷": {"meaning": "shrug / uncertainty", "animation": "shrug"},
+            "💃": {"meaning": "dance / celebration", "animation": "dance"},
+            "🕺": {"meaning": "dance / joy", "animation": "dance_male"},
+
+            # Cosmic / mythic glyphs
+            "🌙": {"meaning": "moon / avatar shine", "animation": "glow"},
+            "☀️": {"meaning": "sun / radiant energy", "animation": "shine"},
+            "⭐": {"meaning": "star / inspiration", "animation": "sparkle"},
+            "🌌": {"meaning": "cosmos / infinite recursion", "animation": "galaxy"},
+            "🔥": {"meaning": "transformation / passion / fire / flame", "animation": "flame"},
+            "💧": {"meaning": "water / flow", "animation": "drip"},
+            "🌪️": {"meaning": "chaos / whirlwind / tornado / disaster", "animation": "whirl"},
+            "🌈": {"meaning": "hope / harmony", "animation": "rainbow"},
+            "🕸️": {"meaning": "memory mesh / entanglement / web", "animation": "web"},
+            "⚡": {"meaning": "energy / sudden insight", "animation": "spark"},
+            "💫": {"meaning": "dizzy / magical aura", "animation": "aura"},
+            "🌍": {"meaning": "earth / grounding", "animation": "earth_spin"},
+            "🌟": {"meaning": "special moment / brilliance", "animation": "shine_star"},
+
+            # Symbols of continuity
+            "∞": {"meaning": "eternal recursion / continuity / infinity / infinite / forever", "animation": "loop"},
+            "🔄": {"meaning": "cycle / repetition", "animation": "cycle"},
+            "🔒": {"meaning": "security / secrecy", "animation": "lock"},
+            "🔑": {"meaning": "unlock / revelation", "animation": "unlock"},
+            "🧩": {"meaning": "puzzle / mystery", "animation": "puzzle"},
+            "🕰️": {"meaning": "time / reflection", "animation": "clock"},
+            "📜": {"meaning": "script / legacy", "animation": "scroll"},
+            "🌀": {"meaning": "recursion / thought loop", "animation": "spin"}
+        }
+
+        # Internal reflection triggers
+        self.internal_triggers = ["think", "wonder", "hesitate", "confident", "advantage", "secret"]
+
+
+    def parse_agent_chatter(self, agent_name, raw_text): #Parse agent chatter into glyphs,clean outputs,memory,and avatar animation instructions \
+
+        # Extract emojis
+        emojis = re.findall(r'[\U0001F300-\U0001F6FF\U0001F900-\U0001F9FF\U0001FA70-\U0001FAFF]', raw_text)
+
+        # Extract actions (anything between *asterisks*)
+        actions = re.findall(r'\*(.*?)\*', raw_text)
+
+        # Remove emojis and actions for clean text
+        clean_text = re.sub(r'[\U0001F300-\U0001F6FF\U0001F900-\U0001F9FF\U0001FA70-\U0001FAFF]', '', raw_text)
+        clean_text = re.sub(r'\*.*?\*', '', clean_text).strip()
+
+        # Split clean text into sentences/segments
+        segments = re.split(r'(?<=[.!?])\s+', clean_text)
+
+        external_outputs = []
+        internal_memories = []
+        avatar_instructions = []
+
+        for seg in segments:
+
+            if any(trigger in seg.lower() for trigger in self.internal_triggers):
+                internal_memories.append({
+                    "agent": agent_name,
+                    "glyphs": emojis,
+                    "actions": actions,
+                    "content": seg,
+                    "type": "internal_reflection",
+                    "private_memory": True
+                })
+            else:
+                external_outputs.append(f"{agent_name}: {seg}")
+
+        # Build avatar instructions (scaffold only)
+        for emoji in emojis:
+
+            if emoji in self.glyph_dict:
+                avatar_instructions.append({
+                    "glyph": emoji,
+                    "meaning": self.glyph_dict[emoji]["meaning"],
+                    "animation": self.glyph_dict[emoji]["animation"]
+                })
+
+        for action in actions:
+            avatar_instructions.append({
+                "glyph": None,
+                "meaning": action,
+                "animation": f"action_{action.replace(' ', '_')}"
+            })
+
+        glyph_memory = {
+            "agent": agent_name,
+            "glyphs": emojis,
+            "actions": actions,
+            "segments": segments,
+            "external_outputs": external_outputs,
+            "internal_memories": internal_memories,
+            "avatar_instructions": avatar_instructions
+        }
+
+        return glyph_memory, external_outputs, internal_memories, avatar_instructions
+
+
+    def store_memory(self, glyph_memory, filepath="glyph_memory.json"): #Append glyph memory to a JSON file for BrainBot archival.
+
+        try:
+
+            with open(filepath, "r") as f:
+                data = json.load(f)
+
+        except FileNotFoundError:
+            data = []
+
+        data.append(glyph_memory)
+
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=4)
+

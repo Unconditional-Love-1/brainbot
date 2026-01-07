@@ -1,0 +1,367 @@
+# .brainbot/core/tools/scanner/deep_scanner.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+#system imports
+import os, json, time
+from datetime import datetime
+from pathlib import Path
+
+
+
+
+class DeepScanner:
+
+
+    def __init__(self, base_path, llm, log, memory_core_cls,
+                 book_processor_cls, file_analyzer_cls,
+                 ocr_func=None, stt_func=None, video_to_audio_func=None):
+
+        self.base = Path(base_path)
+        self.llm = llm
+        self.log = log or (lambda msg: print(msg))
+        self.memory_core_cls = memory_core_cls
+        self.BookProcessor = book_processor_cls
+        self.FileAnalyzer = file_analyzer_cls
+
+        # NEW: multimodal hooks
+        self.ocr_func = ocr_func
+        self.stt_func = stt_func
+        self.video_to_audio_func = video_to_audio_func
+
+
+    def _read_file_best_effort(self, path: str):
+
+        try:
+
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+
+        except Exception:
+            return None  # binary or unreadable
+
+
+    def _load_brainbot_system_file(self):
+
+        system_dir = self.base / "memory" / "system"
+        system_dir.mkdir(parents=True, exist_ok=True)
+        brainbot_file = system_dir / "brainbot.json"
+
+        if brainbot_file.exists():
+
+            try:
+
+                with open(brainbot_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+
+            except Exception as e:
+                self.log(f"⚠️ Failed to load system brainbot.json: {e}")
+
+        return {
+            "agents": {},
+            "code": [],
+            "scanned_files": [],
+            "shortterm": [],
+            "seen_paths": [],
+            "fiction_books": [],
+            "nonfiction_books": []
+        }
+
+
+    def _save_brainbot_system_file(self, data: dict):
+
+        system_dir = self.base / "memory" / "system"
+        brainbot_file = system_dir / "brainbot.json"
+
+        try:
+
+            with open(brainbot_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to save system brainbot.json: {e}")
+
+
+    def _agent_seen_index(self, memory):
+
+        index = {}
+
+        for entry in memory.agent_data.get("seen_paths", []):
+            path = entry.get("path")
+
+            if path:
+                index[path] = entry
+
+        return index
+
+
+    def _system_seen_index(self, system_data):
+
+        index = {}
+
+        for entry in system_data.get("seen_paths", []):
+            path = entry.get("path")
+
+            if path:
+                index[path] = entry
+
+        return index
+
+
+    def _update_seen_paths(self, path, meta, agent_memory, system_data):
+
+        entry = {
+            "path": path,
+            "date": datetime.utcnow().isoformat() + "Z",
+            "hash": meta["hash"],
+            "size": meta["size"],
+            "modified": meta["modified"]
+        }
+
+        # agent
+        agent_memory.agent_data.setdefault("seen_paths", [])
+        agent_memory.agent_data["seen_paths"] = [
+            e for e in agent_memory.agent_data["seen_paths"] if e.get("path") != path
+        ]
+        agent_memory.agent_data["seen_paths"].append(entry)
+        agent_memory._save_agent()
+
+        # system
+        system_data.setdefault("seen_paths", [])
+        system_data["seen_paths"] = [e for e in system_data["seen_paths"] if e.get("path") != path]
+        system_data["seen_paths"].append(entry)
+
+
+    def deep_scan(self, root_dir: str, brainbot_instance, throttle: float = 0.2):
+
+        self.log(f"🧭 Deep scan started at root {root_dir}")
+        scanned_count = 0
+        target_memory = brainbot_instance.active_agent["memory"] if brainbot_instance.active_agent else brainbot_instance.memory
+        agent_name = target_memory.agent_data.get("name", "brainbot")
+        system_data = self._load_brainbot_system_file()
+        file_analyzer = self.FileAnalyzer(
+            llm=self.llm,
+            log=self.log,
+            ocr_func=self.ocr_func,
+            stt_func=self.stt_func,
+            video_to_audio_func=self.video_to_audio_func
+        )
+        book_processor = self.BookProcessor(self.base, self.llm, self.log)
+        agent_seen = self._agent_seen_index(target_memory)
+        system_seen = self._system_seen_index(system_data)
+
+        for dirpath, _, filenames in os.walk(root_dir):
+
+            if brainbot_instance._shutdown_requested:
+                break
+
+            for fname in filenames:
+
+                if brainbot_instance._shutdown_requested:
+                    break
+
+                full_path = os.path.join(dirpath, fname)
+                ext = os.path.splitext(full_path)[1].lower()
+                content = self._read_file_best_effort(full_path)
+
+                if content is None:
+                    content = f"UNREADABLE OR BINARY FILE: {full_path}"
+
+                meta = file_analyzer.collect_meta(full_path, content)
+                need_scan = file_analyzer.should_rescan(full_path, content, agent_seen)
+
+                if not need_scan:
+                    # Build skipped file_summary
+                    file_summary = (
+                        "File skipped. No changes detected since last scan. "
+                        "Hash, size, and modified timestamp match previous record. "
+                        f"Path: {full_path}."
+                    )
+                    # Still update scanned_files with a skip record
+                    scan_record = {
+                        "path": full_path,
+                        "scanned_at": datetime.utcnow().isoformat() + "Z",
+                        "file_label": "unchanged",
+                        "glyphic_memory": "📁",
+                        "file_summary": file_summary
+                    }
+
+                    try:
+                        target_memory.agent_data.setdefault("scanned_files", [])
+                        target_memory.agent_data["scanned_files"].append(scan_record)
+                        target_memory._save_agent()
+                        system_data.setdefault("scanned_files", [])
+                        system_data["scanned_files"].append(scan_record)
+
+                    except Exception as e:
+                        self.log(f"⚠️ Failed to write skip scan record for {full_path}: {e}")
+
+                    continue  # move to next file
+
+                # Decide how to handle by extension / size
+                analysis = None
+                book_result = None
+                is_large = file_analyzer.is_large_text(full_path, content)
+
+                # multimodal dispatch
+                if ext in file_analyzer.IMAGE_EXTENSIONS:
+                    analysis = file_analyzer.analyze_image_file(full_path)
+
+                elif ext in file_analyzer.AUDIO_EXTENSIONS:
+                    analysis = file_analyzer.analyze_audio_file(full_path)
+
+                elif ext in file_analyzer.VIDEO_EXTENSIONS:
+                    analysis = file_analyzer.analyze_video_file(full_path)
+
+                elif is_large:
+                    # Book pipeline
+                    book_result = book_processor.process_book(agent_name, full_path, content)
+                    genre = book_result["genre"]
+                    book_entry = book_result["book_entry"]
+
+                    # Add book entry to agent + system
+                    key = "fiction_books" if genre == "fiction" else "nonfiction_books"
+                    target_memory.agent_data.setdefault(key, [])
+                    target_memory.agent_data[key].append(book_entry)
+                    target_memory._save_agent()
+                    system_data.setdefault(key, [])
+                    system_data[key].append(book_entry)
+                    self.glyph_index.add(book_entry["Glyphic_Memory"], ("book", book_entry["Book"]))
+
+                    # Build unified analysis-like structure for downstream
+                    analysis = {
+                        "file_label": f"{genre}_book",
+                        "summary": book_result["summary"],
+                        "glyphic_memory": book_result["glyphic_memory"],
+                        "code_blocks": [
+                            cb for seg in book_result["segments"] for cb in seg["code_blocks"]
+                        ],
+                        "segments": book_result["segments"],
+                        "scanned_at": datetime.utcnow().isoformat() + "Z",
+                        "path": full_path
+                    }
+
+                else:
+                    # Regular file analysis
+                    analysis = file_analyzer.analyze_regular_file(full_path, content)
+
+                scanned_count += 1
+
+                # Build detailed file_summary
+                file_label = analysis["file_label"]
+                segments = analysis.get("segments", [])
+                code_blocks = analysis.get("code_blocks", [])
+                file_summary_parts = [
+                    f"This file was identified as {file_label}.",
+                    f"Path: {full_path}.",
+                ]
+
+                if book_result:
+                    genre = book_result["genre"]
+                    book_entry = book_result["book_entry"]
+                    seg_count = len(book_result["segments"])
+                    key = "fiction_books" if genre == "fiction" else "nonfiction_books"
+                    file_summary_parts.append(
+                        f"It was processed as a {genre} book titled '{book_entry['Book']}' by {book_entry['Author']}. "
+                        f"The text was segmented into {seg_count} parts. "
+                        f"A full summary was generated and saved to summary.txt in the book folder. "
+                        f"The full summary and glyphic memory were added to {key}[] in agent.json and brainbot.json."
+                    )
+
+                else:
+
+                    # multimodal commentary
+                    if ext in file_analyzer.IMAGE_EXTENSIONS:
+                        file_summary_parts.append(
+                            "This was processed as an image. Any available text was extracted via OCR, "
+                            "and a natural language description was generated and stored in memory."
+                        )
+
+                    elif ext in file_analyzer.AUDIO_EXTENSIONS:
+                        file_summary_parts.append(
+                            "This was processed as an audio file. Any available transcript was summarized "
+                            "and stored in memory."
+                        )
+
+                    elif ext in file_analyzer.VIDEO_EXTENSIONS:
+                        file_summary_parts.append(
+                            "This was processed as a video file. Audio was extracted (if possible), "
+                            "transcribed, and summarized, then stored in memory."
+                        )
+
+                    elif code_blocks:
+                        file_summary_parts.append(
+                            f"Extracted {len(code_blocks)} code blocks and saved them to agent.json:code[] and brainbot.json:code[]."
+                        )
+
+                    else:
+                        file_summary_parts.append("No code blocks were extracted.")
+
+                file_summary_parts.append(
+                    "Scan metadata was added to agent.json:scanned_files[] and brainbot.json:scanned_files[]. "
+                    "Seen path metadata was updated in agent.json:seen_paths[] and brainbot.json:seen_paths[]."
+                )
+
+                file_summary = " ".join(file_summary_parts)
+
+                # Agent memory updates
+                try:
+                    # shortterm summary
+                    target_memory.store_shortterm(
+                        role="scan",
+                        content=file_summary,
+                        glyph=analysis.get("glyphic_memory", "📁"),
+                        thoughts=analysis.get("summary", "")[:500],
+                        source_type="deep_scan",
+                        emotion="neutral",
+                        memory_tag="scan"
+                    )
+
+                    # code blocks
+                    if code_blocks:
+                        target_memory.add_code_blocks(code_blocks, file_path=full_path)
+
+                    # scanned_files record
+                    scan_record = {
+                        "path": analysis["path"],
+                        "scanned_at": analysis["scanned_at"],
+                        "file_label": analysis["file_label"],
+                        "glyphic_memory": analysis["glyphic_memory"],
+                        "file_summary": file_summary
+                    }
+                    target_memory.add_scanned_file_record(scan_record)
+                    glyphs = record.get("glyphic_memory", "")
+                    self.glyph_index.add(glyphs, ("scan", record["path"]))
+
+                except Exception as e:
+                    self.log(f"⚠️ Failed to write agent scan data for {full_path}: {e}")
+
+                # System memory updates
+                try:
+                    system_data.setdefault("shortterm", [])
+                    system_data["shortterm"].append(file_summary)
+
+                    if code_blocks:
+                        system_data.setdefault("code", [])
+                        for block in code_blocks:
+                            block_entry = dict(block)
+                            block_entry["file_path"] = full_path
+                            block_entry["timestamp"] = analysis["scanned_at"]
+                            system_data["code"].append(block_entry)
+
+                    system_data.setdefault("scanned_files", [])
+                    system_data["scanned_files"].append(scan_record)
+
+                except Exception as e:
+                    self.log(f"⚠️ Failed to update brainbot system file for {full_path}: {e}")
+
+                # seen_paths update
+                self._update_seen_paths(full_path, meta, target_memory, system_data)
+
+                time.sleep(throttle)
+
+        self._save_brainbot_system_file(system_data)
+        self.log(f"✅ Deep scan complete. {scanned_count} files scanned under {root_dir}.")
+

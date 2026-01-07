@@ -1,0 +1,128 @@
+#.brainbot\core\utilities\utilities.py     
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+#system imports
+import os, re
+from pathlib import Path
+
+
+
+
+def classify_input(text): #input classification
+
+    text = text.lower().strip()
+    categories = []
+
+    if any(g in text for g in ["hi", "hello", "hey", "greetings"]):
+        categories.append("greeting")
+
+    if any(f in text for f in ["bye", "goodbye", "see you", "later"]):
+        categories.append("farewell")
+
+    if any(t in text for t in ["thanks", "thank you", "appreciate"]):
+        categories.append("thanks")
+
+    if any(a in text for a in ["yes", "okay", "sure", "alright", "correct"]):
+        categories.append("affirmation")
+
+    if any(n in text for n in ["no", "not", "never", "wrong"]):
+        categories.append("negation")
+
+    if any(e in text for e in ["sad", "angry", "happy", "scared", "lonely"]):
+        categories.append("emotion_response")
+
+    if any(p in text for p in ["issue", "problem", "error", "trouble", "bug"]):
+        categories.append("problem_response")
+
+    if text.endswith("?") or any(text.startswith(q) for q in ["what", "who", "how", "why", "where", "when"]):
+        categories.append("question")
+
+    if not categories:
+        categories.append("statement")
+    return categories
+
+
+def is_question(text): #determines if input is a question
+
+    text = text.strip().lower()
+    return text.endswith("?") or any(text.startswith(q) for q in [
+        "what", "who", "how", "why", "where", "when", "is", "are", "can", "do", "does"
+    ])
+
+
+def normalize_question(text): #normalizes question
+
+    try:
+        return text.lower().strip().replace("?", "").replace(".", "").replace(",", "")
+
+    except Exception:
+        return text
+
+
+def valid_answer(answer): #returns a valid answer
+
+    if not answer or len(answer.strip()) < 5:
+        return False
+
+    if "no definition found" in answer.lower():
+        return False
+
+    if "i don't know" in answer.lower():
+        return False
+
+    return True
+
+
+def normalize_next_term(term): #normalizes the next term it uses to define a question
+
+    if not term:
+        return None
+
+    term = term.strip().lower()
+    term = re.sub(r"[^\w\s]", "", term)
+    return term
+
+
+def canonical_path(p): #determines a file tree
+
+    try:
+        return str(Path(p).expanduser().resolve())
+
+    except Exception:
+        return str(p)
+
+
+def read_file(path): #file reader
+
+    try:
+
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+    except Exception:
+        return ""
+
+
+def cleanup_raw_media(folder, log=None): #raw media cleanup tool
+
+    if log:
+        log("🧹 Cleaning up raw media files...")
+
+    try:
+
+        for filename in os.listdir(folder):
+
+            if filename.lower().endswith((".avi", ".wav", ".mp3", ".mp4", ".png", ".jpg", ".jpeg", ".bmp")):
+                path = os.path.join(folder, filename)
+                os.remove(path)
+
+                if log:
+                    log(f"🗑️ Deleted: {filename}")
+
+    except Exception as e:
+
+        if log:
+            log(f"❌ Cleanup failed: {e}")

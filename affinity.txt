@@ -1,0 +1,34 @@
+# .brainbot/core/runtime/affinity.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+import psutil
+from contextlib import contextmanager
+
+
+
+
+@contextmanager
+def set_affinity(cores):
+
+    p = psutil.Process()
+    old = p.cpu_affinity() if hasattr(p, "cpu_affinity") else None
+
+    try:
+
+        if hasattr(p, "cpu_affinity"):
+            p.cpu_affinity(cores)
+        yield
+
+    finally:
+
+        if hasattr(p, "cpu_affinity") and old is not None:
+
+            try:
+                p.cpu_affinity(old)
+
+            except Exception:
+                pass
+

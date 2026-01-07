@@ -1,0 +1,219 @@
+# .brainbot/core/tools/tools.py
+# Created by: David Kistner (Nightmare, Obscurus, Unconditional Love)
+
+
+
+
+#system imports
+import os, json
+from pathlib import Path
+from datetime import datetime
+#folder imports
+from core.tools.cryptomining.mining import MiningController
+from core.llm.llm_controller import LLMController
+
+
+
+class ToolsController:
+
+    def __init__(self, base_path, log=None, memory=None, cognition=None, llm=None):
+
+        self.base = Path(base_path)
+        self.log = log or (lambda msg: print(msg))
+        self.llm = llm
+        self.memory = memory
+        self.cognition = cognition
+        self.mine_dir = self.base / "mine"
+        self.forge_dir = self.base / "forge"
+        self.suggested_code_path = self.forge_dir / "suggestedcode.json"
+        self.mine_dir.mkdir(parents=True, exist_ok=True)
+        self.forge_dir.mkdir(parents=True, exist_ok=True)
+        self.mining = MiningController(base_path, log_function=self.log)
+
+
+
+    def ocr_image(self, path: str) -> str:
+
+        try:
+            if hasattr(self, "perception") and hasattr(self.perception, "read_image_ocr"):
+                return self.perception.read_image_ocr(path)
+
+            return ""
+
+        except Exception as e:
+            self.log(f"⚠️ OCR failed for {path}: {e}")
+            return ""
+
+
+    def transcribe_audio(self, path: str) -> str:
+
+        try:
+
+            if hasattr(self, "perception"):
+                return self.perception.transcribe_audio(path)
+
+            return ""
+
+        except Exception as e:
+            self.log(f"⚠️ Audio transcription failed for {path}: {e}")
+            return ""
+
+
+    def extract_audio_from_video(self, path: str) -> str:
+
+        try:
+
+            if hasattr(self, "perception"):
+                return self.perception.extract_audio_from_avi(path)
+
+            return ""
+
+        except Exception as e:
+            self.log(f"⚠️ Video audio extraction failed for {path}: {e}")
+            return ""
+
+
+    def forge(self, task_description):
+
+        code, summary, emotion = "", task_description, "neutral"
+
+        if self.cognition and getattr(self.cognition, "llm", None):
+
+            try:
+
+                agent_for_llm = getattr(self.memory, "active_agent", None) or "llama2"
+                agent_name = getattr(self.memory, "assigned_agent_name", "Agent")
+
+                prompt = (
+                    f"You are the active agent ({agent_for_llm}) coding with pyforge as {agent_name}.\n\n"
+                    f"Task: {task_description}\n"
+                    "Write Python code that fulfills this task.\n"
+                    "Respond in JSON with keys: code, summary, emotion."
+                )
+                llm_output = self.cognition.llm.query(prompt, agent=agent_for_llm).strip()
+
+                parsed = json.loads(llm_output)
+                code = parsed.get("code", "")
+                summary = parsed.get("summary", summary)
+                emotion = parsed.get("emotion", emotion)
+
+            except Exception as e:
+                self.log(f"⚠️ PyForge LLM failed: {e}")
+     
+        try:  # Save suggested code to forge/suggestedcode.json
+
+            with open(self.suggested_code_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "task": task_description,
+                    "code": code,
+                    "summary": summary,
+                    "emotion": emotion,
+                    "timestamp": datetime.utcnow().isoformat()
+                }, f, indent=2)
+            self.log(f"💾 Suggested code saved to {self.suggested_code_path}")
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to save suggested code: {e}")
+
+        # Store reflection in memory
+        if self.memory:
+            self.memory.store_reflection(
+                role="forge",
+                content=code,
+                glyph="⚒️",
+                thoughts=summary,
+                source_type="pyforge",
+                emotion=emotion,
+                important=True
+            )
+        return {"code": code, "summary": summary, "emotion": emotion}
+
+    def start_miner(self, wallet_address, pool="pool.supportxmr.com:3333", extra_args=None):     # Start XMR miner
+
+        try:
+            self.mining.start_mining(wallet_address, pool=pool, extra_args=extra_args)
+
+            if self.memory:
+                self.memory.store_reflection(
+                    role="miner",
+                    content=f"Started mining to wallet: {wallet_address}",
+                    glyph="⛏️",
+                    thoughts=f"Mining ritual initiated at {pool}",
+                    source_type="xmrig",
+                    memory_tag="mining"
+                )
+            return f"⛏️ Mining started for wallet: {wallet_address}"
+
+        except Exception as e:
+            self.log(f"❌ Failed to start miner: {e}")
+            return "⚠️ Miner start failed."
+
+    def stop_miner(self): #stop miner
+
+        try:
+            self.mining.stop_mining()
+
+            if self.memory:
+                self.memory.store_reflection(
+                    role="miner",
+                    content="Mining ritual halted.",
+                    glyph="🛑",
+                    thoughts="Miner stopped by ToolsController.",
+                    source_type="xmrig",
+                    memory_tag="mining"
+                )
+            return "🛑 Mining stopped."
+
+        except Exception as e:
+            self.log(f"❌ Failed to stop miner: {e}")
+            return "⚠️ Miner stop failed."
+
+    def miner_status(self): # miner status
+
+        try:
+            status = self.mining.status()
+            return f"📊 Miner status: {status}"
+
+        except Exception as e:
+            self.log(f"❌ Failed to check miner status: {e}")
+            return "⚠️ Status check failed."
+
+    def vm_command(self, command): #virtual machine commander
+
+        summary, emotion = command, "neutral"
+
+        if self.cognition and getattr(self.cognition, "llm", None):
+
+            try:
+                agent_for_llm = getattr(self.memory, "active_agent", None) or "llama2"
+                agent_name = getattr(self.memory, "assigned_agent_name", "Agent")
+                user_name = (self.memory.load_user_identity().get("name", "Nightmare") if self.memory else "Nightmare")
+
+                prompt = (
+                    f"You are the active agent ({agent_for_llm}) using a Windows VM as {agent_name}.\n\n"
+                    f"User ({user_name}) request: {command}\n"
+                    "Task:\n"
+                    "- Generate a valid Windows command or script.\n"
+                    "- Summarize what it does.\n"
+                    "Respond in JSON with keys: command, summary, emotion."
+                )
+                llm_output = self.cognition.llm.query(prompt, agent=agent_for_llm).strip()
+                parsed = json.loads(llm_output)
+                command = parsed.get("command", command)
+                summary = parsed.get("summary", summary)
+                emotion = parsed.get("emotion", emotion)
+            except Exception as e:
+                self.log(f"⚠️ VM command LLM failed: {e}")
+
+        if self.memory:
+            self.memory.store_reflection(
+                role="vm",
+                content=command,
+                glyph="🖥️",
+                thoughts=summary,
+                source_type="windows_vm",
+                emotion=emotion,
+                important=True
+            )
+        return {"command": command, "summary": summary, "emotion": emotion}
+

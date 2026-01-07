@@ -1,0 +1,55 @@
+# .brainbot/core/memory/glyph_index.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+
+
+
+class GlyphIndex:
+
+
+    def __init__(self):
+
+        self.index = {}  # {glyph: [memory_refs]}
+
+
+    def add(self, glyphs, ref):
+
+        if not glyphs:
+            return
+
+        for g in glyphs:
+
+            if g.strip():
+                self.index.setdefault(g, [])
+
+                if ref not in self.index[g]:
+                    self.index[g].append(ref)
+
+
+    def query(self, glyphs):
+
+        results = []
+
+        for g in glyphs:
+            results.extend(self.index.get(g, []))
+
+        return results
+
+
+    def query_all(self, glyphs):
+
+        sets = []
+
+        for g in glyphs:
+
+            if g in self.index:
+                sets.append(set(self.index[g]))
+
+        if not sets:
+            return []
+
+        return list(set.intersection(*sets))
+

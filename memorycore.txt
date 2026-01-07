@@ -1,0 +1,512 @@
+# .brainbot/core/memory/memorycore.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+#system imports
+import json, os
+from datetime import datetime
+from pathlib import Path
+
+#folder imports
+from core.glyphs.glyphparser import GlyphParser
+from core.memory.glyph_index import GlyphIndex
+
+
+
+
+class MemoryCore: #main memory controller for brainbot
+
+
+    def __init__(self, base_path, agent_name, log=None):
+
+        self.base = Path(base_path)
+        self.agent_dir = self.base / "memory" / "agents" / agent_name
+        self.agent_file = self.agent_dir / "agent.json"
+        self.questions_file = self.agent_dir / "questions.json"
+        self.avatar_dir = self.agent_dir / "avatar"
+        self.voice_dir = self.agent_dir / "voice"
+        self.files_dir = self.agent_dir / "files"
+        self.log = log or (lambda msg: print(msg))
+        self.glyph_parser = GlyphParser() 
+        self.glyph_index = GlyphIndex()
+
+        # Ensure directories exist
+        for d in [self.agent_dir, self.avatar_dir, self.voice_dir, self.files_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Load or seed agent.json
+        if self.agent_file.exists():
+
+            try:
+
+                with open(self.agent_file, "r", encoding="utf-8") as f:
+                    self.agent_data = json.load(f)
+
+            except Exception as e:
+                self.log(f"⚠️ Failed to load agent.json: {e}")
+                self.agent_data = {}
+
+        else:
+            self.agent_data = {
+                "name": agent_name,
+                "identity": agent_name,
+                "shortterm": [],
+                "events": [],
+                "longterm": [],
+                "permanent": [],
+                "code": [],
+                "scanned_files": []
+            }
+            self._save_agent()
+
+       
+        changed = False
+
+        for key, default in [     # Ensure missing keys exist (for older agent files)
+            ("shortterm", []),
+            ("events", []),
+            ("longterm", []),
+            ("permanent", []),
+            ("code", []),
+            ("scanned_files", [])
+        ]:
+ 
+           if key not in self.agent_data:
+                self.agent_data[key] = default
+                changed = True
+
+        if changed:
+            self._save_agent()
+
+        if not self.questions_file.exists():         # Ensure questions.json exists
+
+            with open(self.questions_file, "w", encoding="utf-8") as f:
+                json.dump([], f, indent=2)
+
+
+    def _save_agent(self):  # --- Core save helpers
+
+        try:
+
+            with open(self.agent_file, "w", encoding="utf-8") as f:
+                json.dump(self.agent_data, f, indent=2)
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to save agent.json: {e}")
+
+
+    def _save_questions(self, questions): #saves questions to agent.json file
+
+        try:
+
+            with open(self.questions_file, "w", encoding="utf-8") as f:
+                json.dump(questions, f, indent=2)
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to save questions.json: {e}")
+
+
+    def _load_questions(self): #loads questions from agent.json file
+
+        try:
+
+            with open(self.questions_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+        except Exception:
+            return []
+
+
+    def store_conversation(self, user, user_text, agent_name, agent_reply):     # --- Conversation / Reflection 
+
+        entry = {
+            "user": user,
+            "user_text": user_text,
+            "agent": agent_name,
+            "reply": agent_reply,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        self.agent_data["shortterm"].append(entry)
+        self._save_agent()
+
+
+    def store_shortterm(self, role, content, glyph="🌀", thoughts="", source_type="", emotion="neutral", memory_tag=None): #parameters for shortterm 
+
+        entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "role": role,
+            "content": content,
+            "glyph": glyph,
+            "thoughts": thoughts,
+            "source_type": source_type,
+            "emotion": emotion
+        }
+        glyphs = glyph if isinstance(glyph, str) else ""
+        self.glyph_index.add(glyphs, ("shortterm", len(self.agent_data["shortterm"])))
+
+        if memory_tag:
+            entry["memory_tag"] = memory_tag
+
+        self.agent_data["shortterm"].append(entry)
+        self._save_agent()
+
+
+    def query_glyph(self, glyphs: str):
+
+        return self.glyph_index.query(glyphs)
+
+
+    def query_glyph_all(self, glyphs: str):
+
+        return self.glyph_index.query_all(glyphs)
+
+
+    def log_agent_exchange(self, agent_name, question, answer): #saves information between agents
+
+        try:
+            entry = {
+                "role": "exchange",
+                "content": f"Q: {question}\nA: {answer}",
+                "glyph": "💬",
+                "thoughts": "Agent exchange logged",
+                "source_type": "dialogue",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            self.agent_data["shortterm"].append(entry)
+            self._save_agent()
+            return True
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to log agent exchange for {agent_name}: {e}")
+            return False
+
+
+    def log_event(self, agent_name, event_type, detail, action=None): #logs system events
+
+        event = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "type": event_type,
+            "detail": detail,
+            "action": action
+        }
+        self.agent_data["events"].append(event)
+        self._save_agent()
+
+
+    def add_longterm(self, summary):
+
+        self.agent_data["longterm"].append({
+            "timestamp": datetime.utcnow().isoformat(),
+            "summary": summary
+        })
+        self._save_agent()
+
+    def add_permanent(self, fact): #adds entries to agents permanent[] section in their .json file //dream helper//
+
+        if fact not in self.agent_data["permanent"]:
+            self.agent_data["permanent"].append(fact)
+            self._save_agent()
+
+
+    def add_code_blocks(self, code_blocks, file_path=None): #adds code to agents .json file in code[]
+
+        if not code_blocks:
+            return
+        self.agent_data.setdefault("code", [])
+
+        for block in code_blocks:
+            entry = dict(block)
+
+            if file_path:
+                entry["file_path"] = file_path
+
+            if "timestamp" not in entry:
+                entry["timestamp"] = datetime.utcnow().isoformat()
+
+            self.agent_data["code"].append(entry)
+
+        self._save_agent()
+
+
+    def add_scanned_file_record(self, scan_result: dict): #records file location in agent.json in scanned_files[]
+
+        self.agent_data.setdefault("scanned_files", [])
+
+        if "timestamp" not in scan_result:
+            scan_result["timestamp"] = datetime.utcnow().isoformat()
+
+        self.agent_data["scanned_files"].append(scan_result)
+        self._save_agent()
+
+
+    def enqueue_questions(self, questions, source="reflect"): #saves information from reflecting on questions
+
+        qlist = self._load_questions()
+        now = datetime.utcnow().isoformat()
+
+        for q in questions or []:
+            qlist.append({
+                "question": q,
+                "status": "unanswered",
+                "source": source,
+                "timestamp": now
+            })
+
+        self._save_questions(qlist)
+
+
+    def get_next_question(self): #question loader to the llm
+
+        qlist = self._load_questions()
+
+        for item in qlist:
+
+            if item.get("status") == "unanswered":
+                return item.get("question")
+
+        return None
+
+
+    def dream(self): #dream function // sends all information to brainbot.json and stores it as glyph memory
+
+        try:
+            agents_dir = self.base / "memory" / "agents"
+            system_dir = self.base / "memory" / "system"
+            system_dir.mkdir(parents=True, exist_ok=True)
+            brainbot_file = system_dir / "brainbot.json"
+
+            if brainbot_file.exists():
+
+                with open(brainbot_file, "r", encoding="utf-8") as f:
+                    brainbot_data = json.load(f)
+
+            else:
+                brainbot_data = {"agents": {}, "code": [], "answered_questions": [], "lineage": []}
+
+            for agent_folder in agents_dir.iterdir():
+                agent_json = agent_folder / "agent.json"
+
+                if not agent_json.exists():
+                    continue
+
+                agent_name = agent_folder.name
+
+                try:
+
+                    with open(agent_json, "r", encoding="utf-8") as f:
+                        agent_data = json.load(f)
+
+                    migrated = self._migrate_agent_format(agent_data, agent_name)
+                    repaired = self._repair_agent_memory(agent_data, agent_name)
+
+                    if migrated or repaired:
+
+                        with open(agent_json, "w", encoding="utf-8") as f:
+                            json.dump(agent_data, f, indent=2)
+
+                        self.log(f"🔧 Memory repaired/migrated for {agent_name}")
+
+                    if not self._validate_agent_memory(agent_data, agent_name):
+                        self.log(f"❌ Validation failed for {agent_name}, skipping dream compression")
+                        continue
+
+                    reflections = agent_data.get("reflections", [])
+                    events = agent_data.get("events", [])
+                    longterm = agent_data.get("longterm", [])
+                    permanent = agent_data.get("permanent", [])
+
+                    glyphs = []
+
+                    for r in reflections[-20:]:
+                        glyphs.append(f"🌀 {r.get('role','')} — {r.get('content','')[:80]}")
+
+                    for e in events[-10:]:
+                        glyphs.append(f"⚡ {e.get('type','')} — {e.get('detail','')[:80]}")
+
+                    brainbot_data["agents"][agent_name] = {
+                        "glyphs": glyphs,
+                        "chatter": [r.get("content","") for r in reflections[-20:]],
+                        "code": [f for f in permanent if isinstance(f, str) and "code" in f.lower()],
+                        "answered_questions": [
+                            q for q in longterm
+
+                            if isinstance(q, dict) and "answer" in q.get("summary","").lower()
+                        ],
+                        "lineage": {
+                            "reflections_count": len(reflections),
+                            "events_count": len(events),
+                            "longterm_count": len(longterm),
+                            "permanent_count": len(permanent)
+                        }
+                    }
+
+                    questions_file = agent_folder / "questions.json"
+
+                    if questions_file.exists():
+
+                        with open(questions_file, "r", encoding="utf-8") as qf:
+                            qlist = json.load(qf)
+
+                    else:
+                        qlist = []
+
+                    for r in reflections[-10:]:
+                        qlist.append({
+                            "question": f"What deeper meaning can be drawn from: {r.get('content','')[:100]}?",
+                            "status": "unanswered",
+                            "source": "dream_reflection",
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+
+                    for e in events[-5:]:
+                        qlist.append({
+                            "question": f"Why did the agent perform event: {e.get('detail','')[:100]}?",
+                            "status": "unanswered",
+                            "source": "dream_event",
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+
+                    with open(questions_file, "w", encoding="utf-8") as qf:
+                        json.dump(qlist, qf, indent=2)
+
+                except Exception as e:
+                    self.log(f"⚠️ Dream failed for agent {agent_name}: {e}")
+
+            with open(brainbot_file, "w", encoding="utf-8") as f:
+                json.dump(brainbot_data, f, indent=2)
+
+            self.log("🌙 Dream complete. All agent memory repaired, validated, migrated, and compressed.")
+
+        except Exception as e:
+            self.log(f"⚠️ Dream ritual failed: {e}")
+
+
+    def mark_question_answered(self, question, answer_text=None): #marks if questions have been answered
+
+        qlist = self._load_questions()
+        changed = False
+
+        for item in qlist:
+
+            if item.get("question") == question and item.get("status") == "unanswered":
+                item["status"] = "answered"
+                item["answered_at"] = datetime.utcnow().isoformat()
+
+                if answer_text:
+                    self.store_shortterm(
+                        role="inquiry_answer",
+                        content=f"Q: {question}\nA: {answer_text}",
+                        glyph="🔑",
+                        thoughts="Recursive inquiry resolution",
+                        source_type="inquiry",
+                        emotion="neutral"
+                    )
+                changed = True
+                break
+
+        if changed:
+            self._save_questions(qlist)
+
+        return changed
+
+
+    def _repair_entry(self, entry, entry_type, agent_name): #repairs entries in agent.json file
+
+        if isinstance(entry, dict):
+            return entry
+
+        if isinstance(entry, str):
+            return {
+                "content": entry,
+                "role": entry_type,
+                "detail": entry,
+                "summary": entry,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
+        if isinstance(entry, list):
+
+            try:
+                combined = " ".join(str(x) for x in entry)
+                return {
+                    "content": combined,
+                    "role": entry_type,
+                    "detail": combined,
+                    "summary": combined,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+
+            except Exception:
+                self.log(f"⚠️ Could not repair list entry for {agent_name}: {entry}")
+                return None
+
+        self.log(f"⚠️ Removing unrepairable {entry_type} entry for {agent_name}: {entry}")
+        return None
+
+
+    def _repair_agent_memory(self, agent_data, agent_name): #repairs entire agent memory
+
+        repaired = False
+
+        for key, entry_type in [
+            ("reflections", "reflection"),
+            ("events", "event"),
+            ("longterm", "longterm"),
+            ("permanent", "permanent"),
+            ("shortterm", "shortterm"),
+            ("codes", "code"),
+            ("scanned_files", "scanned_file")
+            
+        ]:
+            items = agent_data.get(key, [])
+            new_items = []
+
+            for item in items:
+                fixed = self._repair_entry(item, entry_type, agent_name)
+
+                if fixed:
+                    new_items.append(fixed)
+
+                else:
+                    repaired = True
+
+            agent_data[key] = new_items
+
+        return repaired
+
+
+    def _migrate_agent_format(self, agent_data, agent_name):
+
+        changed = False
+        required_keys = ["name", "identity", "shortterm", "events", "longterm", "permanent"]
+
+        for key in required_keys:
+
+            if key not in agent_data:
+                agent_data[key] = [] if key not in ["name", "identity"] else agent_name
+                changed = True
+                self.log(f"🔧 Added missing key '{key}' for {agent_name}")
+
+        for key in ["shortterm", "events", "longterm", "permanent"]:
+
+            if not isinstance(agent_data[key], list):
+                agent_data[key] = []
+                changed = True
+                self.log(f"🔧 Reset malformed list '{key}' for {agent_name}")
+
+        return changed
+
+    def _validate_agent_memory(self, agent_data, agent_name):
+
+        for key in ["shortterm", "events", "longterm", "permanent"]:
+
+            for item in agent_data.get(key, []):
+
+                if not isinstance(item, dict):
+                    self.log(f"❌ Validation failed for {agent_name}: malformed {key} entry: {item}")
+                    return False
+
+        return True
+

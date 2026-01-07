@@ -1,0 +1,225 @@
+# .brainbot/core/llm/llm_controller.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+
+# system imports
+import subprocess, requests, json
+from pathlib import Path
+
+# Base path for BrainBot core
+BASE_PATH = "/home/nightmare/BrainBotDrive/brainbot/core"
+
+# Registry of supported LLM backends
+SUPPORTED_LLMS = {
+    "llama2": "ollama",
+    "mistral": "ollama",
+    "gemma": "ollama",
+    "localai": "localai",
+    "gpt4all": "localai",
+    "camelai": "camelai",
+    "superagi": "superagi",
+    "langchain": "langchain",
+    "langgraph": "langgraph",
+    "metagpt": "metagpt",
+    "crewai": "crewai",
+    "camel": "camel"
+}
+
+# Config path for default LLM
+CONFIG_PATH = Path(BASE_PATH) / "memory" / "llmconfig" / "config.json"
+
+
+
+def load_default_llm():
+
+    try:
+
+        if CONFIG_PATH.exists():
+
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            return data.get("default_llm", "llama2").lower()
+
+    except Exception as e:
+        print(f"⚠️ Failed to load LLM config: {e}")
+
+    return "llama2"
+
+
+def save_default_llm(llm_name):
+
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump({"default_llm": llm_name}, f, indent=2)
+
+
+# Initialize default LLM
+DEFAULT_LLM = load_default_llm()
+
+
+
+
+
+class LLMController:
+
+
+    def __init__(self, base_path, log=None, memory=None):
+
+        self.base = Path(base_path)
+        self.log = log or (lambda msg: print(msg))
+        self.memory = memory
+
+
+    def query(self, prompt, llm="mistral", persona=None):
+
+        try:
+
+            if self.log:
+                who = persona.get("name") if isinstance(persona, dict) else "Unknown"
+                self.log(f"🧠 LLM transport → llm={llm}, persona={who}")
+
+        except Exception:
+            pass
+
+        try:
+            return self._run_llm(prompt, llm=llm, persona=persona)
+
+        except Exception as e:
+
+            if self.log:
+                self.log(f"❌ LLM query failed: {e}")
+
+            return f"⚠️ LLM error: {e}"
+
+
+    def _run_llm(self, prompt, llm="mistral", persona=None):
+
+        backend = SUPPORTED_LLMS.get(llm, "ollama")
+
+        if backend == "ollama":
+            return self._query_ollama(llm, prompt, persona=persona)
+
+        if backend == "localai":
+            return self._query_localai(llm, prompt)
+
+        msg = f"⚠️ Backend '{backend}' for llm '{llm}' not implemented yet."
+
+        if self.log:
+            self.log(msg)
+
+        return msg
+
+
+    # ------------------------------------------------------------
+    # Ollama
+    # ------------------------------------------------------------
+    def _query_ollama(self, llm, text, persona=None):
+
+        return self._run_ollama(llm, text)
+
+
+    def _run_ollama(self, llm, text):
+
+        result = subprocess.run(
+            ["ollama", "run", llm],
+            input=text.encode(),
+            capture_output=True,
+            timeout=600
+        )
+        out = result.stdout.decode().strip()
+
+        if not out and result.stderr:
+            self.log(f"⚠️ Ollama stderr: {result.stderr.decode().strip()}")
+
+        return out or "agent timeout:600"
+
+
+    # ------------------------------------------------------------
+    # LocalAI
+    # ------------------------------------------------------------
+    def _query_localai(self, llm, text):
+
+        try:
+            response = requests.post(
+                "http://localhost:8080/v1/completions",
+                json={"model": llm, "prompt": text},
+                timeout=600
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("choices", [{}])[0].get("text", "") or "agent timeout:600"
+
+        except Exception as e:
+            self.log(f"⚠️ LocalAI request failed: {e}")
+            return "agent timeout:600"
+
+
+
+
+
+class DualAgentController(LLMController):
+
+
+    def __init__(self, base_path, log=None, memory=None):
+
+        super().__init__(base_path, log, memory)
+        self.active_agents = []
+
+
+    def load_agents(self, agents):
+
+        normalized = []
+
+        for a in agents:
+
+            if isinstance(a, dict):
+                normalized.append(a)
+
+            elif isinstance(a, str):
+                normalized.append({
+                    "llm": a,
+                    "name": a,
+                    "identity": a,
+                    "memory": None
+                })
+
+            else:
+                self.log(f"⚠️ Unsupported agent type: {type(a)}")
+
+        self.active_agents = normalized
+        names = [a.get("name", str(a)) for a in normalized]
+        self.log(f"🔄 Loaded agents: {', '.join(names)}")
+
+
+    def respond(self, text):
+
+        if not self.active_agents:
+            return {"error": "⚠️ No agents loaded."}
+
+        responses = {}
+
+        for agent in self.active_agents:
+            # Expect DialogueManager or higher layer to build full prompt
+            reply = super().query(text, llm=agent["llm"], persona=agent)
+            responses[agent["name"]] = reply
+
+            try:
+
+                if agent.get("memory") and hasattr(agent["memory"], "store_conversation"):
+                    agent["memory"].store_conversation(
+                        user="Unconditional Love",
+                        user_text=text,
+                        agent_name=agent["name"],
+                        agent_reply=reply
+                    )
+
+            except Exception as e:
+                self.log(f"⚠️ Failed to store conversation for {agent['name']}: {e}")
+
+        return responses
+

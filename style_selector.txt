@@ -1,0 +1,98 @@
+#.brainbot\core\cognition\style_selector.py   
+# Created by: David Kistner(aka: Nightmare, Obscurus, Unconditional Love)
+
+
+
+
+import json
+from pathlib import Path
+from sklearn.linear_model import LogisticRegression
+
+
+
+
+class StyleSelector:
+
+
+    def __init__(self, base_path=None, log=None):
+
+        self.model = LogisticRegression()
+        self.trained = False
+        self.classes_ = ["concise", "poetic", "step"]
+        self.base = Path(base_path or ".")
+        self.log = log or (lambda msg: print(msg))
+
+
+    def train(self, X, y):     # Training (optional ML)
+
+        self.model.fit(X, y)
+        self.trained = True
+
+
+    def features(self, text, persona):
+
+        return [
+            len(text),
+            int(text.strip().endswith("?")),
+            persona.get("prefers_step", 0),
+            persona.get("poetic_mode", 0),
+        ]
+
+
+    def predict_style(self, text, persona):
+
+        if not self.trained:
+            # Heuristic fallback
+
+            if persona.get("prefers_step", 0) > 0:
+                return "step"
+
+            if persona.get("poetic_mode", 0) > 0:
+                return "poetic"
+
+            return "concise"
+
+        return self.model.predict([self.features(text, persona)])[0]
+
+
+    def create_agent(self, name, voice, role, personality, style_flags=None):     # Agent Persona Management
+
+        agent = {
+            "name": name,
+            "voice": voice,
+            "role": role,
+            "personality": personality,
+            "style_flags": style_flags or {},
+            "log": []
+        }
+        return agent
+
+
+    def save_agent(self, agent, filename=None):
+
+        filename = filename or f"{agent['name'].lower()}.json"
+        out_path = self.base / "memory" / "agents" / filename
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(agent, f, indent=2)
+
+        self.log(f"💾 Agent saved: {out_path}")
+        return out_path
+
+
+    def load_agent(self, filename): #Load agent persona from JSON file.
+
+        try:
+
+            with open(filename, "r", encoding="utf-8") as f:
+                agent = json.load(f)
+
+            self.log(f"📁 Agent loaded: {agent.get('name')}")
+            return agent
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to load agent: {e}")
+            return None
+
+

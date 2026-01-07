@@ -1,0 +1,35 @@
+#.brainbot\core\feedback\feedback_bus.py   
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+class Event:
+
+
+    def __init__(self, kind, payload, ts):
+
+        self.kind = kind
+        self.payload = payload
+        self.ts = ts
+
+
+
+
+class FeedbackBus:
+
+
+    def __init__(self):
+
+        self.subscribers = []
+
+
+    def publish(self, event: Event):
+
+        for s in self.subscribers:
+            s.handle(event)
+
+
+    def subscribe(self, subscriber):
+
+        self.subscribers.append(subscriber)

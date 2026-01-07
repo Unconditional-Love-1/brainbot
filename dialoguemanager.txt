@@ -1,0 +1,372 @@
+# .brainbot/core/dialogue/dialoguemanager.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+# system imports
+import threading, time, json, random, re
+
+# folder imports
+from core.glyphs.glyphparser import GlyphParser
+
+
+
+
+
+class DialogueManager:
+
+
+    def __init__(self, llm, chat_fn, log_fn, brain_memory=None):
+
+        self.llm = llm
+        self.chat = chat_fn
+        self.log = log_fn
+        self.brain_memory = brain_memory  # optional BrainBot-level memory
+        self._shutdown_requested = False
+        self._thread = None
+
+        # Persistent parser instance
+        self.parser = GlyphParser()
+
+
+    def clean_and_split(self, raw_text, agent_name):     # Output cleaning / internal thought extraction
+
+        if not raw_text:
+            return {
+                "agent": agent_name,
+                "external_output": "...",
+                "thoughts": []
+            }
+
+        text = re.sub(r'\*\*.*?\*\*', '', raw_text)
+        actions = re.findall(r'\*(.*?)\*', text)
+        text = re.sub(r'\*.*?\*', '', text).strip()
+        emojis = re.findall(
+            r'[\U0001F300-\U0001F6FF\U0001F900-\U0001F9FF\U0001FA70-\U0001FAFF]',
+            text
+        )
+        clean_text = re.sub(
+            r'[\U0001F300-\U0001F6FF\U0001F900-\U0001F9FF\U0001FA70-\U0001FAFF]',
+            '',
+            text
+        ).strip()
+        internal = []
+
+        for a in actions:
+            internal.append(f"action: {a}")
+
+        for e in emojis:
+            internal.append(f"emoji: {e}")
+
+        introspection_triggers = ["think", "wonder", "feel", "hesitate", "dream", "ponder"]
+
+        for seg in re.split(r'(?<=[.!?])\s+', clean_text):
+
+            if any(t in seg.lower() for t in introspection_triggers):
+                internal.append(f"thought: {seg}")
+
+        return {
+            "agent": agent_name,
+            "external_output": clean_text or "...",
+            "thoughts": internal
+        }
+
+
+    def build_agent_context(self, agent_data, user_info, limit=40):     # Persona + memory context builder
+
+        name = agent_data.get("name", "")
+        identity = agent_data.get("identity", "")
+        role = agent_data.get("role", "")
+        personality = agent_data.get("personality", "")
+        permanent = agent_data.get("permanent", [])
+        being = agent_data.get("being", "")
+        voice = agent_data.get("voice", "")
+
+        if agent_data.get("_session_longterm_loaded", False):
+            longterm = agent_data.get("longterm", [])
+
+        else:
+            longterm = []
+
+        shortterm = agent_data.get("shortterm", [])
+        shortterm_block = "\n".join([
+            f"User ({entry.get('user','')}): {entry.get('user_text','')}\n"
+            f"{entry.get('agent','')}: {entry.get('reply','')}\n"
+            for entry in shortterm
+        ])
+        dialogue_history = "\n".join([
+            f"{r.get('timestamp','')} {r.get('role','')}: {r.get('content','')}"
+            for r in shortterm
+        ])
+        longterm_block = "\n".join(longterm) if isinstance(longterm, list) else str(longterm)
+        context = (
+            f"You are {name}, a {being} with the job of a {role}.\n"
+            f"Identity: {identity}\n"
+            f"Personality: {personality}\n"
+            f"Voice: {voice}\n"
+            f"Permanent traits: {permanent}\n"
+            f"Long-term memory:\n{longterm_block}\n\n"
+            f"Do not respond with your name ({name}) or role ({role}) unless asked directly.\n"
+            f"Greet only once per session.\n"
+            f"Never repeat your output.\n"
+            f"Respond in character consistent with your Identity, Personality, Being, and Voice.\n"
+            f"Never respond as another Agent or User; keep to your own Identity.\n"
+            f"Use Memory and Dialogue History to determine the next best response.\n"
+            f"Memory (short-term records):\n{shortterm}\n\n"
+            f"Dialogue History:\n{dialogue_history}\n\n"
+            f"Address each Agent and User with their correct name when speaking directly to them.\n"
+            f"You are to speak with other Agents only, unless addressed as {identity} by the User.\n"
+        )
+        return context
+
+
+    def decay_shortterm_memory(self, agent):     # Memory helpers: decay + summarization
+
+        try:
+            max_len = 80
+            chunk_size = 40
+            st = agent.get("shortterm", [])
+
+            if not isinstance(st, list) or len(st) <= max_len:
+                return
+
+            # Take the oldest chunk
+            old_chunk = st[:-chunk_size]
+            keep_chunk = st[-chunk_size:]
+
+            # Summarize old chunk
+            summary_prompt = (
+                "Summarize the following dialogue and internal notes into a compact long-term memory entry.\n\n"
+                f"{old_chunk}\n\n"
+                "Return a single concise paragraph."
+            )
+            summary = self.llm.query(summary_prompt, llm=agent["llm"], persona=agent)
+
+            # Append to longterm (in memory + in agent_data)
+            longterm = agent.get("longterm", [])
+
+            if not isinstance(longterm, list):
+                longterm = [str(longterm)]
+
+            longterm.append(summary)
+            agent["longterm"] = longterm
+
+            if agent.get("memory") and hasattr(agent["memory"], "add_longterm"):
+                agent["memory"].add_longterm(summary)
+
+            # Keep only the most recent shortterm
+            agent["shortterm"] = keep_chunk
+
+        except Exception as e:
+            self.log(f"⚠️ Shortterm decay failed for {agent.get('name','?')}: {e}")
+
+
+    def start(self, agents, initial_text="You have walked into a conversation with other Agents. Interpret dialogue and ask each other individually specific questions. Get to know other agents before user sets the topic.", delay=2, mode="round_robin"):
+    
+        if self._thread and self._thread.is_alive():
+            self.log("⚠️ Dialogue already running.")
+            return
+
+        if not agents or len(agents) < 2:
+            self.log("⚠️ Need at least 2 agents to start dialogue.")
+            return
+
+        self._shutdown_requested = False
+
+        # Load longterm memory once per session
+        for agent in agents:
+            agent_data = agent.get("agent_data", agent)
+            agent_data["_session_longterm_loaded"] = True
+
+        def loop():
+
+            msg = initial_text  # baton starts here
+            turn_index = 0
+
+            while not self._shutdown_requested:
+
+                try:
+                    # --- Determine reply targets ---
+                    if mode == "round_robin":
+                        agent = agents[turn_index % len(agents)]
+                        prev_agent = agents[(turn_index - 1) % len(agents)]
+                        reply_targets = [(agent, prev_agent, msg)]
+
+                    elif mode == "broadcast":
+                        prev_agent = agents[(turn_index - 1) % len(agents)]
+                        reply_targets = [(a, prev_agent, msg) for a in agents]
+
+                    elif mode == "random":
+                        agent = random.choice(agents)
+                        prev_agent = agents[(turn_index - 1) % len(agents)]
+                        reply_targets = [(agent, prev_agent, msg)]
+
+                    elif mode == "debate":
+                        agent_a, agent_b = agents[0], agents[1]
+    
+                        if turn_index % 2 == 0:
+                            reply_targets = [(agent_a, agent_b, msg)]
+
+                        else:
+                            reply_targets = [(agent_b, agent_a, msg)]
+
+                        if len(agents) > 2 and turn_index % 3 == 0:
+                            commentator = agents[2]
+                            reply_targets.append((commentator, agent_a, msg))
+
+                    elif mode == "open_chat":
+                        prev_agent = agents[(turn_index - 1) % len(agents)]
+                        reply_targets = [(a, prev_agent, msg) for a in agents]
+
+                    else:  # fallback
+                        agent = agents[turn_index % len(agents)]
+                        prev_agent = agents[(turn_index - 1) % len(agents)]
+                        reply_targets = [(agent, prev_agent, msg)]
+
+                    # --- Process replies ---
+                    collected_outputs = []
+
+                    for agent, prev_agent, baton in reply_targets:
+                        agent_data = agent.get("agent_data", agent)
+                        user_info = {"name": "User", "identity": ""}
+
+                        # Unified persona + memory context
+                        context = self.build_agent_context(agent_data, user_info, limit=40)
+    
+                        # --- Decision mode (open_chat) ---
+                        if mode == "open_chat":
+                            decision_prompt = (
+                                f"{context}\n\n"
+                                f"Last message:\n\"{baton}\"\n\n"
+                                "Return JSON ONLY:\n"
+                                "{ \"respond\": true/false, \"message\": \"...\" }"
+                            )
+
+                            raw_decision = self.llm.query(decision_prompt, llm=agent["llm"], persona=agent)
+
+                            try:
+                                decision = json.loads(raw_decision)
+
+                            except Exception:
+                                decision = {"respond": True, "message": raw_decision}
+
+                            if not decision.get("respond"):
+                                continue
+
+                            raw_reply = decision.get("message", "").strip()
+
+                            if not raw_reply:
+                                continue
+
+                        else: # --- Normal reply mode ---
+
+                            reply_prompt = (
+                                f"{context}\n\n"
+                                f"Last message:\n\"{baton}\"\n\n"
+                                "Respond in character. Never reply as another Agent. Greet only once."
+                            )
+                            raw_reply = self.llm.query(reply_prompt, llm=agent["llm"], persona=agent)
+
+                        # --- Parse output ---
+                        parsed = self.clean_and_split(raw_reply, agent["name"])
+                        self.chat(parsed["external_output"], agent_name=agent["name"])
+                        collected_outputs.append(parsed["external_output"])
+
+                        # --- Memory handling ---
+                        if agent.get("memory") and hasattr(agent["memory"], "store_conversation"):
+                            agent["memory"].store_conversation(
+                                "system", baton, agent["name"], parsed["external_output"]
+                            )
+
+                        if parsed["thoughts"] and agent.get("memory") and hasattr(agent["memory"], "store_shortterm"):
+                            agent["memory"].store_shortterm(
+                                role="thought",
+                                content=" | ".join(parsed["thoughts"]),
+                                glyph="🤔",
+                                thoughts="Internal memory",
+                                source_type="dialogue"
+                            )
+
+                        # Glyph parsing
+                        _, _, _, avatar_instructions = self.parser.parse_agent_chatter(agent["name"], raw_reply)
+                        if avatar_instructions and agent.get("memory") and hasattr(agent["memory"], "store_shortterm"):
+                            agent["memory"].store_shortterm(
+                                role="avatar_instruction",
+                                content=json.dumps(avatar_instructions),
+                                glyph="⭐",
+                                thoughts="Avatar animation mapping",
+                                source_type="glyph"
+                            )
+
+                        # Brain-level memory
+                        if self.brain_memory:
+                            summary = f"{prev_agent['name']} → {agent['name']}: {baton} | {parsed['external_output']}"
+                            try:
+                                self.brain_memory.add_longterm(summary)
+                            except Exception as e:
+                                self.log(f"⚠️ Failed to write brain_memory summary: {e}")
+
+                        # Optional: decay shortterm memory
+                        self.decay_shortterm_memory(agent)
+    
+                    # --- Update baton for next turn ---
+                    if mode in ["broadcast", "open_chat"]:
+                        msg = " | ".join(collected_outputs) if collected_outputs else msg
+                    else:
+                        msg = collected_outputs[-1] if collected_outputs else msg
+
+                    turn_index += 1
+                    time.sleep(delay)
+
+                except Exception as e:
+                    self.log(f"⚠️ Dialogue loop error: {e}")
+                    time.sleep(delay)
+
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+        self.log(f"✅ Dialogue loop started in {mode} mode.")
+
+
+    def stop(self):
+
+        self._shutdown_requested = True
+
+        for agent in getattr(self, "agents", []):         # Finalize memory for all agents
+            self.finalize_session_memory(agent)
+
+        self.log("🛑 Dialogue loop stopped and memory finalized.")
+        self._thread = None
+
+
+    def finalize_session_memory(self, agent):
+
+        try:
+            st = agent.get("shortterm", [])
+
+            if not st:
+                return
+
+            lt = agent.get("longterm", [])
+
+            if not isinstance(lt, list):
+                lt = [str(lt)]
+
+            # Append all shortterm entries to longterm
+            lt.extend(st)
+            agent["longterm"] = lt
+
+            # Clear shortterm
+            agent["shortterm"] = []
+
+            # Save back to agent.json
+            if "json_path" in agent:
+
+                with open(agent["json_path"], "w", encoding="utf-8") as f:
+                    json.dump(agent, f, indent=2)
+
+            self.log(f"💾 Memory finalized for {agent.get('name','?')}")
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to finalize memory: {e}")
+

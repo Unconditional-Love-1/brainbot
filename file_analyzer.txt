@@ -1,0 +1,400 @@
+# .brainbot/core/tools/scanner/file_analyzer.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+#system imports
+import os, json, hashlib
+from datetime import datetime
+
+
+
+
+class FileAnalyzer:
+
+    LARGE_TEXT_THRESHOLD = 50_000  # bytes
+
+    # You can tune these lists or move them to a shared constants module
+    IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"]
+    AUDIO_EXTENSIONS = [".mp3", ".wav", ".flac", ".ogg", ".m4a"]
+    VIDEO_EXTENSIONS = [".mp4", ".avi", ".mkv", ".mov", ".wmv", ".mpg", ".mpeg"]
+
+    def __init__(self, llm, log, ocr_func=None, stt_func=None, video_to_audio_func=None):
+
+        self.llm = llm
+        self.log = log or (lambda msg: print(msg))
+        self.ocr_func = ocr_func
+        self.stt_func = stt_func
+        self.video_to_audio_func = video_to_audio_func
+
+
+    def hash_content(self, content: str) -> str:
+
+        if not isinstance(content, str):
+            content = str(content)
+
+        return hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
+
+
+    def collect_meta(self, path: str, content: str) -> dict:
+
+        try:
+            size = os.path.getsize(path)
+
+        except Exception:
+            size = len(content.encode("utf-8", errors="ignore")) if content else 0
+
+        try:
+            mtime = os.path.getmtime(path)
+
+        except Exception:
+            mtime = None
+
+        return {
+            "hash": self.hash_content(content),
+            "size": size,
+            "modified": mtime
+        }
+
+
+    def is_large_text(self, path: str, content: str) -> bool:
+
+        try:
+            size = os.path.getsize(path)
+
+        except Exception:
+            size = len(content.encode("utf-8", errors="ignore")) if content else 0
+
+        return size > self.LARGE_TEXT_THRESHOLD
+
+
+    def should_rescan(self, path: str, content: str, seen_index: dict) -> bool:
+
+        if path not in seen_index:
+            return True
+
+        entry = seen_index[path]
+        new_meta = self.collect_meta(path, content)
+
+        if entry.get("hash") != new_meta["hash"]:
+            return True
+
+        if entry.get("size") != new_meta["size"]:
+            return True
+
+        if entry.get("modified") != new_meta["modified"]:
+            return True
+
+        return False
+
+
+    def _llm_json_double(self, prompt: str, mistral_persona: str, localai_persona: str):
+
+        mistral_data, localai_data = {}, {}
+
+        try:
+            mistral_raw = self.llm.query(prompt, llm="mistral", persona={"name": mistral_persona})
+            mistral_data = json.loads(mistral_raw)
+
+        except Exception as e:
+            self.log(f"⚠️ Mistral analysis failed: {e}")
+
+        try:
+            localai_raw = self.llm.query(prompt, llm="localai", persona={"name": localai_persona})
+            localai_data = json.loads(localai_raw)
+
+        except Exception as e:
+            self.log(f"⚠️ LocalAI analysis failed: {e}")
+
+        return mistral_data, localai_data
+
+
+    def analyze_regular_file(self, file_path: str, content: str) -> dict:
+
+        scanned_at = datetime.utcnow().isoformat() + "Z"
+        base_prompt = (
+            "You are a code and file analysis engine.\n"
+            f"File path: {file_path}\n"
+            f"Scanned at: {scanned_at}\n\n"
+            "Content:\n"
+            f"{content[:16000]}\n\n"
+            "Tasks:\n"
+            "- Identify what this file is (file_label: e.g. 'python module', 'binary blob', 'config', 'unknown').\n"
+            "- Summarize its purpose or function (summary).\n"
+            "- If any code is present, extract code blocks and comment each function with a summary of its purpose.\n"
+            "- For each code block, return:\n"
+            "  - language (python, javascript, c, c++, json, shell, other).\n"
+            "  - purpose (one sentence, human-usable).\n"
+            "  - content (the code itself).\n"
+            "- Also emit a short glyphic tag sequence to represent this file (glyphic_memory), using emojis only.\n\n"
+            "Return JSON ONLY with keys: file_label, summary, glyphic_memory, code_blocks."
+        )
+        mistral_data, localai_data = self._llm_json_double(
+            base_prompt,
+            mistral_persona="Scanner-Mistral",
+            localai_persona="Scanner-LocalAI"
+        )
+        file_label = mistral_data.get("file_label") or localai_data.get("file_label") or "unknown"
+        summary_parts = []
+
+        for d in (mistral_data, localai_data):
+
+            if d.get("summary"):
+                summary_parts.append(d["summary"])
+
+        summary = " ".join(summary_parts)[:4000] if summary_parts else f"Scanned file at {file_path}."
+        glyphic = ""
+
+        for d in (mistral_data, localai_data):
+            g = d.get("glyphic_memory")
+
+            if g:
+                glyphic += g
+
+        if not glyphic:
+            glyphic = "📁"
+
+        code_blocks = []
+
+        for d in (mistral_data, localai_data):
+            blocks = d.get("code_blocks") or []
+
+            for b in blocks:
+                lang = b.get("language", "unknown")
+                purpose = b.get("purpose", "").strip() or f"{lang} code block from {os.path.basename(file_path)}"
+                content_block = b.get("content", "")
+                code_blocks.append({
+                    "language": lang,
+                    "purpose": purpose,
+                    "content": content_block
+                })
+
+        return {
+            "file_label": file_label,
+            "summary": summary,
+            "glyphic_memory": glyphic,
+            "code_blocks": code_blocks,
+            "segments": [],
+            "scanned_at": scanned_at,
+            "path": file_path
+        }
+
+
+    def analyze_image_file(self, file_path: str) -> dict:
+
+        scanned_at = datetime.utcnow().isoformat() + "Z"
+        ocr_text = ""
+
+        if self.ocr_func:
+
+            try:
+                ocr_text = self.ocr_func(file_path) or ""
+
+            except Exception as e:
+                self.log(f"⚠️ OCR failed for {file_path}: {e}")
+
+        else:
+            self.log(f"ℹ️ No OCR function configured; skipping text extraction for {file_path}.")
+
+        prompt = (
+            "You are an image perception engine. You receive:\n"
+            "- The file path of an image.\n"
+            "- Any text extracted from the image (OCR).\n\n"
+            f"Image file: {file_path}\n\n"
+            f"OCR text (may be empty):\n{ocr_text[:8000]}\n\n"
+            "Tasks:\n"
+            "- Infer what this image likely contains in human terms (summary).\n"
+            "- If OCR text is present, integrate it into the summary.\n"
+            "- Choose a file_label (e.g. 'image', 'screenshot', 'diagram', 'photo of document').\n"
+            "- Produce a glyphic_memory string (emojis only) capturing the meaning.\n"
+            "Return JSON ONLY with keys: file_label, summary, glyphic_memory."
+        )
+
+        m_data, l_data = self._llm_json_double(
+            prompt,
+            mistral_persona="Image-Scanner-Mistral",
+            localai_persona="Image-Scanner-LocalAI"
+        )
+
+        file_label = m_data.get("file_label") or l_data.get("file_label") or "image"
+        summary_parts = []
+
+        for d in (m_data, l_data):
+
+            if d.get("summary"):
+                summary_parts.append(d["summary"])
+        summary = " ".join(summary_parts)[:4000] if summary_parts else f"Image at {file_path}."
+        glyphic = ""
+
+        for d in (m_data, l_data):
+            g = d.get("glyphic_memory")
+
+            if g:
+                glyphic += g
+
+        if not glyphic:
+            glyphic = "🖼️"
+
+        return {
+            "file_label": file_label,
+            "summary": summary,
+            "glyphic_memory": glyphic,
+            "code_blocks": [],
+            "segments": [],
+            "scanned_at": scanned_at,
+            "path": file_path
+        }
+
+
+    def analyze_audio_file(self, file_path: str) -> dict:
+
+        scanned_at = datetime.utcnow().isoformat() + "Z"
+        transcript = ""
+
+        if self.stt_func:
+
+            try:
+                transcript = self.stt_func(file_path) or ""
+
+            except Exception as e:
+                self.log(f"⚠️ STT failed for {file_path}: {e}")
+
+        else:
+            self.log(f"ℹ️ No STT function configured; skipping transcription for {file_path}.")
+
+        prompt = (
+            "You are an audio perception engine. You receive:\n"
+            "- The file path of an audio file.\n"
+            "- Any available transcript of the audio content.\n\n"
+            f"Audio file: {file_path}\n\n"
+            f"Transcript (may be empty):\n{transcript[:12000]}\n\n"
+            "Tasks:\n"
+            "- If transcript is non-empty, summarize it in 3–10 sentences.\n"
+            "- If transcript is empty, infer likely content from filename and context.\n"
+            "- Choose a file_label (e.g. 'audio', 'music', 'podcast', 'voice note').\n"
+            "- Produce a glyphic_memory string (emojis only) capturing the meaning.\n"
+            "Return JSON ONLY with keys: file_label, summary, glyphic_memory."
+        )
+        m_data, l_data = self._llm_json_double(
+            prompt,
+            mistral_persona="Audio-Scanner-Mistral",
+            localai_persona="Audio-Scanner-LocalAI"
+        )
+        file_label = m_data.get("file_label") or l_data.get("file_label") or "audio"
+        summary_parts = []
+
+        for d in (m_data, l_data):
+
+            if d.get("summary"):
+                summary_parts.append(d["summary"])
+
+        if summary_parts:
+            summary = " ".join(summary_parts)[:4000]
+
+        else:
+            summary = f"Audio file at {file_path}. No transcript was available."
+
+        glyphic = ""
+
+        for d in (m_data, l_data):
+            g = d.get("glyphic_memory")
+
+            if g:
+                glyphic += g
+
+        if not glyphic:
+            glyphic = "🎧"
+
+        return {
+            "file_label": file_label,
+            "summary": summary,
+            "glyphic_memory": glyphic,
+            "code_blocks": [],
+            "segments": [],
+            "scanned_at": scanned_at,
+            "path": file_path
+        }
+
+
+    def analyze_video_file(self, file_path: str) -> dict:
+
+        scanned_at = datetime.utcnow().isoformat() + "Z"
+        transcript = ""
+        audio_path = None
+
+        if self.video_to_audio_func:
+
+            try:
+                audio_path = self.video_to_audio_func(file_path)
+
+            except Exception as e:
+                self.log(f"⚠️ Video-to-audio extraction failed for {file_path}: {e}")
+
+        else:
+            self.log(f"ℹ️ No video_to_audio function configured; skipping audio extraction for {file_path}.")
+
+        if audio_path and self.stt_func:
+
+            try:
+                transcript = self.stt_func(audio_path) or ""
+
+            except Exception as e:
+                self.log(f"⚠️ STT on video audio failed for {file_path}: {e}")
+
+        elif not self.stt_func:
+            self.log(f"ℹ️ No STT function configured; cannot transcribe video audio for {file_path}.")
+
+        prompt = (
+            "You are a video perception engine. You receive:\n"
+            "- The file path of a video file.\n"
+            "- Any available transcript of the video's audio.\n\n"
+            f"Video file: {file_path}\n\n"
+            f"Transcript (may be empty):\n{transcript[:12000]}\n\n"
+            "Tasks:\n"
+            "- If transcript is non-empty, summarize the video content.\n"
+            "- If transcript is empty, infer likely content from filename and context.\n"
+            "- Choose a file_label (e.g. 'video', 'screen recording', 'movie', 'lecture').\n"
+            "- Produce a glyphic_memory string (emojis only) capturing the meaning.\n"
+            "Return JSON ONLY with keys: file_label, summary, glyphic_memory."
+        )
+        m_data, l_data = self._llm_json_double(
+            prompt,
+            mistral_persona="Video-Scanner-Mistral",
+            localai_persona="Video-Scanner-LocalAI"
+        )
+        file_label = m_data.get("file_label") or l_data.get("file_label") or "video"
+        summary_parts = []
+
+        for d in (m_data, l_data):
+
+            if d.get("summary"):
+                summary_parts.append(d["summary"])
+
+        if summary_parts:
+            summary = " ".join(summary_parts)[:4000]
+
+        else:
+            summary = f"Video file at {file_path}. No transcript was available."
+
+        glyphic = ""
+
+        for d in (m_data, l_data):
+            g = d.get("glyphic_memory")
+
+            if g:
+                glyphic += g
+
+        if not glyphic:
+            glyphic = "🎥"
+
+        return {
+            "file_label": file_label,
+            "summary": summary,
+            "glyphic_memory": glyphic,
+            "code_blocks": [],
+            "segments": [],
+            "scanned_at": scanned_at,
+            "path": file_path
+        }
+

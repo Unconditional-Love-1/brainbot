@@ -1,0 +1,264 @@
+# .brainbot/core/perception/perceptionengine.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+#system imports
+import os, json, threading, subprocess, random, time
+from pathlib import Path
+from datetime import datetime
+
+#folder imports
+from core.utilities.utilities import canonical_path, read_file
+
+#fallback imports
+try:
+    import fitz  # PyMuPDF for PDFs
+
+except Exception:
+    fitz = None
+
+try:
+    from docx import Document
+
+except Exception:
+    Document = None
+
+try:
+    import speech_recognition as sr
+
+except Exception:
+    sr = None
+
+
+# Emotion → Emoji glyph map
+EMOTION_EMOJI = {
+    "joy": "😊",
+    "sadness": "😢",
+    "anger": "😠",
+    "awe": "🤯",
+    "fear": "😨",
+    "love": "❤️",
+    "neutral": "😐"
+}
+
+READABLE_EXTENSIONS = [".txt", ".md", ".json", ".py", ".html", ".xml", ".pdf", ".doc", ".docx", ".srt", ".tmp"]
+AUDIO_EXTENSIONS = [".mp3", ".wav"]
+VIDEO_EXTENSIONS = [".mpeg", ".avi", ".mov", ".mpg", ".wmv", ".mp4"]
+
+
+
+
+
+
+class PerceptionEngine:
+
+
+    def __init__(self, base_path, log=None, memory=None, cognition=None, tools=None, llm=None):
+
+        self.base = Path(base_path)
+        self.log = log or (lambda msg: print(msg))
+        self.tools = tools
+        self.memory = memory        # active agent MemoryCore or BrainBot fallback
+        self.cognition = cognition
+        self.llm = llm
+
+        # Runtime state
+        self._seen_lock = threading.RLock()
+        self._seen = set()
+        self._is_training = False
+        self._shutdown_requested = False
+        self._scan_thread_started = False
+
+        # Seen paths file
+        self.seen_path = self.base / "memory" / "seen_paths.json"
+        self.seen_path.parent.mkdir(parents=True, exist_ok=True)
+        self._load_seen_paths()
+
+        self.log("✅ PerceptionEngine initialized (agent‑centric storage).")
+
+
+    def _load_seen_paths(self):
+
+        if not self.seen_path.exists():
+
+            with open(self.seen_path, "w", encoding="utf-8") as f:
+                json.dump([], f)
+
+            self.log("📁 Created empty seen_paths.json")
+
+        try:
+
+            with open(self.seen_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+
+            with self._seen_lock:
+                self._seen = set(map(canonical_path, raw))
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to load seen paths: {e}")
+            self._seen = set()
+
+
+    def _save_seen_paths(self):
+
+        try:
+
+            with self._seen_lock:
+                raw = list(self._seen)
+
+            with open(self.seen_path, "w", encoding="utf-8") as f:
+                json.dump(raw, f, indent=2)
+
+            self.log(f"💾 Saved {len(raw)} seen paths.")
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to save seen paths: {e}")
+
+
+    def is_seen(self, path):
+
+        try:
+            cp = canonical_path(path)
+
+            with self._seen_lock:
+                return cp in self._seen
+
+        except Exception as e:
+            self.log(f"⚠️ is_seen check failed for {path}: {e}")
+            return False
+
+
+    def read_image_ocr(self, path):
+        # placeholder for future OCR engine
+        return ""
+
+
+    def read_docx(self, path): #document reader
+
+        if not Document:
+            return ""
+
+        try:
+            doc = Document(path)
+            text = "\n".join([para.text for para in doc.paragraphs])
+            self.log(f"📄 Read DOCX: {path}")
+            return text
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to read DOCX: {path} — {e}")
+            return ""
+
+
+    def read_pdf(self, path): #pdf reader
+
+        if not fitz:
+            self.log("⚠️ PyMuPDF not available.")
+            return ""
+
+        try:
+            doc = fitz.open(path)
+
+            if doc.page_count == 0:
+                raise ValueError("Empty or invalid PDF")
+
+            text = ""
+
+            for page in doc:
+                text += page.get_text() or ""
+
+            doc.close()
+            self.log(f"📄 Read PDF: {path}")
+            return text
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to read PDF: {path} — {e}")
+            return ""
+
+
+    def read_srt(self, path): #subtitle reader
+
+        try:
+
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            dialogue_blocks, buffer = [], []
+
+            for line in lines:
+                line = line.strip()
+
+                if line == "":
+
+                    if buffer:
+                        dialogue_blocks.append(" ".join(buffer))
+                        buffer = []
+
+                elif not line.isdigit() and "-->" not in line:
+                    buffer.append(line)
+
+            if buffer:
+                dialogue_blocks.append(" ".join(buffer))
+
+            pairs = []
+
+            for block in dialogue_blocks:
+
+                if ":" in block:
+                    parts = block.split(":", 1)
+                    speaker = parts[0].strip()
+                    line = parts[1].strip()
+
+                    if speaker and line and len(speaker) < 80:
+                        pairs.append((speaker, line))
+
+            self.log(f"🎭 Read SRT: {path} with {len(pairs)} speaker-line pairs.")
+            return "\n".join([f"{speaker}: {line}" for speaker, line in pairs])
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to read SRT: {path} — {e}")
+            return ""
+
+
+    def transcribe_audio(self, path): #transcribes audio into text using a .json format
+
+        if not path or not os.path.exists(path):
+            self.log(f"⚠️ Audio file not found: {path}")
+            return ""
+
+        if not sr:
+            self.log("⚠️ speech_recognition not available.")
+            return ""
+
+        try:
+            recognizer = sr.Recognizer()
+
+            with sr.AudioFile(path) as source:
+                audio = recognizer.record(source)
+
+            transcript = recognizer.recognize_google(audio)
+            self.log(f"🎙️ Transcribed audio from {path}")
+            return transcript
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to transcribe audio: {e}")
+            return ""
+
+
+    def extract_audio_from_avi(self, path): #extracts audio in .wav format from video files
+
+        try:
+            out_path = str(Path(path).with_suffix(".wav"))
+            cmd = [
+                "ffmpeg", "-y", "-i", path,
+                "-vn", "-acodec", "pcm_s16le",
+                "-ar", "16000", "-ac", "1", out_path
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.log(f"🎞️ Extracted audio to {out_path}")
+            return out_path
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to extract audio: {e}")
+            return ""
+

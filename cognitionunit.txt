@@ -1,0 +1,111 @@
+#.brainbot\core\cognition\cognitionunit.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+#system imports
+import os, json, threading, random, time
+from datetime import datetime
+from pathlib import Path
+
+#folder imports
+from core.memory.memorycore import MemoryCore
+from core.llm.llm_controller import LLMController
+
+
+
+
+class CognitionUnit: #Cognition Controller
+
+
+    def __init__(self, base_path, log=None, memory=None, perception=None, tools=None, senses=None, llm=None): # cognition initialization
+
+        self.base = Path(base_path)
+        self.log = log or (lambda msg: print(msg))
+        self.memory = memory
+        self.perception = perception
+        self.tools = tools
+        self.senses = senses
+        self.llm = llm
+        self._shutdown_requested = False
+        self._craving_enabled = False
+
+
+    def respond(self, text, source="voice"):
+
+        agent_context = getattr(self.memory, "active_agent", None)
+
+        if agent_context:            # Agent-level response
+            agent_name = agent_context["name"]
+            prompt = f"You are {agent_name}. Unconditional Love said: {text}"
+            reply = self.llm.query(prompt, llm=agent_context["llm"], persona=agent_context).strip()
+            agent_context["memory"].store_conversation("user", text, agent_name, reply)
+            return reply
+
+        else:            # BrainBot-level response
+            prompt = f"You are BrainBot, the higher system intelligence. Unconditional Love said: {text}"
+            reply = self.llm.query(prompt, llm="mistral", persona={"name": "BrainBot"}).strip()
+            self.memory.add_longterm(f"BrainBot replied: {reply}")
+            return reply
+
+
+    def begin_recursive_inquiry(self, agent_context=None):
+
+        self._shutdown_requested = False
+
+        while not self._shutdown_requested:
+
+            try:
+                question = self.memory.get_next_question() if hasattr(self.memory, "get_next_question") else None
+
+                if not question:
+                    time.sleep(2); continue
+
+                targets = [agent_context] if agent_context else (getattr(self.llm, "active_agents", []) or [])
+
+                for ctx in targets:
+
+                    if not ctx: continue
+                    answer = self.llm.query(question, llm=ctx["llm"], persona=ctx).strip()
+                    ctx["memory"].store_conversation("system", question, ctx["name"], answer)
+
+            except Exception as e:
+                self.log(f"⚠️ Recursive inquiry failed: {e}")
+                time.sleep(2)
+
+
+    def enable_craving(self, interval=300): #Autonomous craving loop: scan, sense, inquiry
+
+        if self._craving_enabled:
+            self.log("⚠️ Craving loop already enabled.")
+            return
+
+        self._craving_enabled = True
+
+        def craving_cycle():
+
+            actions = ["sense", "inquiry"]
+
+            while not self._shutdown_requested:
+                choice = random.choice(actions)
+                self.log(f"🔥 Craving triggered: {choice}")
+
+                if choice == "sense" and self.senses:
+                    packet = self.senses.sense_audio()
+                    self.memory.store_shortterm(
+                        role="sense",
+                        content=str(packet),
+                        glyph="🎙️",
+                        thoughts="Sensory memory",
+                        source_type="sense",
+                        emotion=packet.get("emotion", "neutral")
+                    )
+
+                elif choice == "inquiry":
+                    threading.Thread(target=self.begin_recursive_inquiry, daemon=True).start()
+
+                time.sleep(interval)
+
+        threading.Thread(target=craving_cycle, daemon=True).start()
+

@@ -1,0 +1,1172 @@
+# .brainbot/desktop.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+#system imports
+import sys, threading, time, json, os, psutil
+from datetime import datetime
+from pathlib import Path
+from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QTextEdit, QLineEdit, QMenuBar, QMenu, QAction,
+    QDockWidget, QVBoxLayout, QInputDialog, QDialog, QVBoxLayout, QDialogButtonBox, QLabel,
+    QCheckBox, QFileDialog, QTabWidget
+)
+
+#folder imports
+from core.tools.tools import ToolsController
+from core.memory.memorycore import MemoryCore
+from core.cognition.style_selector import StyleSelector
+from core.llm.llm_controller import SUPPORTED_LLMS, save_default_llm, load_default_llm
+from core.dialogue.dialoguemanager import DialogueManager
+
+BASE_PATH = "/home/nightmare/BrainBotDrive/brainbot/core"
+
+
+class CoreSelectionDialog(QDialog):
+
+
+    def __init__(self, cores, parent=None):
+
+        super().__init__(parent)
+        self.setWindowTitle("Assign CPU Cores")
+        self.selected_cores = []
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Select cores for this agent:"))
+        self.checkboxes = []
+
+        for c in cores:
+            cb = QCheckBox(f"Core {c}")
+            layout.addWidget(cb)
+            self.checkboxes.append((c, cb))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
+    def get_selected(self):
+
+        return [c for c, cb in self.checkboxes if cb.isChecked()]
+
+
+
+
+class DesktopInterface(QMainWindow):
+
+    def __init__(self):
+
+        super().__init__()
+        print("🧠 Initializing DesktopInterface...")
+        self.setWindowTitle("Desktop Interface")
+        self.setGeometry(100, 100, 1200, 800)
+
+        # Central widget
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        central_layout = QVBoxLayout(central)
+        central.setLayout(central_layout)
+
+        # Background
+        bg_path = f"{BASE_PATH}/../gui/background.png"
+        self.setStyleSheet(f"""
+            QMainWindow {{
+                background-image: url({bg_path});
+                background-repeat: no-repeat;
+                background-position: center;
+                background-attachment: fixed;
+            }}
+        """)
+
+        # Menu bar
+        self.menu_bar = QMenuBar(self)
+        self.setMenuBar(self.menu_bar)
+        self.menu_bar.setStyleSheet("background-color: black; color: white; font-size: 13px;")
+
+        # Identity
+        self.user_name = "Unconditional Love"
+        self.user_identity = "David Kistner"
+
+        # Runtime state
+        self.brain = None
+        self.tools = None
+        self.active_agents = []
+        self.active_llms = [load_default_llm()]
+        self.bot_loaded = False
+        self.voice_enabled = False
+        self.last_user_input_time = time.time()
+        self.pending_clarification_agent = None
+
+        # Deep scan state
+        self.deep_scan_active = False
+        self.deep_scan_thread = None
+        self.deep_scan_progress = "Idle"
+
+        # Status timer
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self.update_user_status)
+        self.status_timer.start(10000)
+
+        try:
+            self.tools = ToolsController(base_path=BASE_PATH, log=self.log)
+        except Exception as e:
+            self.log(f"⚠️ ToolsController init deferred: {e}")
+
+        print("✅ DesktopInterface initialized.")
+
+        # Rituals menu
+        rituals_menu = QMenu("🧠 Rituals", self)
+        rituals_menu.addAction(QAction("📚 Learn", self, triggered=self.run_learn))
+        rituals_menu.addAction(QAction("⚒️ Forge", self, triggered=self.run_forge))
+        rituals_menu.addAction(QAction("⚒️ Forge (Prompt)", self, triggered=self.prompt_forge))
+        rituals_menu.addAction(QAction("Dream", self, triggered=lambda: self.brain.dream()))
+        self.menu_bar.addMenu(rituals_menu)
+
+        # Mining menu
+        mining_menu = QMenu("⛏️ Mining", self)
+        mining_menu.addAction(QAction("Start Miner", self, triggered=self.prompt_wallet))
+        mining_menu.addAction(QAction("Stop Miner", self, triggered=self.stop_miner))
+        mining_menu.addAction(QAction("Miner Status", self, triggered=self.miner_status))
+        self.menu_bar.addMenu(mining_menu)
+
+        # System menu
+        system_menu = QMenu("🖥️ System", self)
+        system_menu.addAction(QAction("Load Bot", self, triggered=self.load_bot))
+        system_menu.addAction(QAction("Shutdown", self, triggered=lambda: QApplication.quit()))
+        system_menu.addAction(QAction("Set Default LLM", self, triggered=self.prompt_set_default_llm))
+        self.menu_bar.addMenu(system_menu)
+
+        # Deep Scanner menu
+        deep_scan_menu = QMenu("🔍 Deep Scanner", self)
+        deep_scan_menu.addAction(QAction("Deep Scan (Directory)", self, triggered=self.prompt_deep_scan))
+        deep_scan_menu.addAction(QAction("Stop Deep Scan", self, triggered=self.stop_deep_scan))
+        self.menu_bar.addMenu(deep_scan_menu)
+
+        # Agent Menu
+        agents_menu = QMenu("👥 Agents", self)
+        agents_menu.addAction(QAction("Load Agent (Folder)", self, triggered=self.prompt_load_agent_folder))
+        agents_menu.addAction(QAction("Create Agent Folder", self, triggered=self.prompt_create_agent_folder))
+        agents_menu.addAction(QAction("Unload Agent", self, triggered=self.prompt_unload_agent))
+        agents_menu.addAction(QAction("List Active Agents", self, triggered=self.update_status_panel))
+        self.menu_bar.addMenu(agents_menu)
+
+        # LLM menu
+        llm_menu = QMenu("🧩 LLM", self)
+        for llm in SUPPORTED_LLMS.keys():
+            llm_menu.addAction(QAction(llm.capitalize(), self,
+                triggered=lambda checked, key=llm: self.set_llm(key)))
+
+        unload_llm_menu = QMenu("Unload LLM", self)
+        unload_llm_menu.addAction(QAction("Remove Active LLM", self, triggered=self.prompt_unload_llm))
+        llm_menu.addMenu(unload_llm_menu)
+        self.menu_bar.addMenu(llm_menu)
+
+        # Toggles menu
+        toggles_menu = QMenu("⚙️ Toggles", self)
+        self.inquiry_toggle = QAction("Recursive Inquiry", self, checkable=True)
+        self.craving_toggle = QAction("Cravings", self, checkable=True)
+        self.senses_toggle = QAction("Senses", self, checkable=True)
+        toggles_menu.addActions([
+            self.inquiry_toggle,
+            self.craving_toggle,
+            self.senses_toggle,
+        ])
+        self.menu_bar.addMenu(toggles_menu)
+
+        #agent dialogue menu
+        dialogue_menu = QMenu("🗣️ Dialogue", self)
+        dialogue_menu.addAction(QAction("Start Round Robin", self,
+            triggered=lambda: (
+                self.dialogue_manager.start(self.active_agents, mode="round_robin")
+
+                if hasattr(self, "dialogue_manager") and len(self.active_agents) >= 2
+
+                else self.chat("⚠️ DialogueManager not ready or not enough agents.", agent_name="System")
+            )
+        ))
+        dialogue_menu.addAction(QAction("Start Broadcast", self,
+            triggered=lambda: (
+                self.dialogue_manager.start(self.active_agents, mode="broadcast")
+
+                if hasattr(self, "dialogue_manager") and len(self.active_agents) >= 2
+
+                else self.chat("⚠️ DialogueManager not ready or not enough agents.", agent_name="System")
+            )
+        ))
+        dialogue_menu.addAction(QAction("Open Chat", self,
+            triggered=lambda: (
+                self.dialogue_manager.start(self.active_agents, mode="open_chat")
+
+                if hasattr(self, "dialogue_manager") and len(self.active_agents) >= 2
+
+                else self.chat("⚠️ DialogueManager not ready or not enough agents.", agent_name="System")
+            )
+        ))
+        dialogue_menu.addAction(QAction("Start Random", self,
+            triggered=lambda: (
+                self.dialogue_manager.start(self.active_agents, mode="random")
+
+                if hasattr(self, "dialogue_manager") and len(self.active_agents) >= 2
+
+                else self.chat("⚠️ DialogueManager not ready or not enough agents.", agent_name="System")
+            )
+        ))
+        dialogue_menu.addAction(QAction("Start Debate", self,
+            triggered=lambda: (
+                self.dialogue_manager.start(self.active_agents, mode="debate")
+
+                if hasattr(self, "dialogue_manager") and len(self.active_agents) >= 2
+
+                else self.chat("⚠️ DialogueManager not ready or not enough agents.", agent_name="System")
+            )
+        ))
+        dialogue_menu.addAction(QAction("Stop Dialogue", self,
+            triggered=lambda: (
+                self.dialogue_manager.stop()
+
+                if hasattr(self, "dialogue_manager")
+
+                else self.chat("⚠️ DialogueManager not ready.", agent_name="System")
+            )
+        ))
+        self.menu_bar.addMenu(dialogue_menu)
+
+        # Chat dock
+        self.chat_window = QTextEdit()
+        self.chat_window.setReadOnly(True)
+        self.chat_window.setStyleSheet("background-color: rgba(0,0,0,160); color: white;")
+        self.chat_dock = QDockWidget("Chat", self)
+        self.chat_dock.setWidget(self.chat_window)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.chat_dock)
+
+        # Status indicator
+        self.status_action = QAction("🟢 User Active", self)
+        self.status_action.setEnabled(False)
+
+        # Log window with tab
+        self.log_status_tabs = QTabWidget()
+        self.log_window = QTextEdit()
+        self.log_window.setReadOnly(True)
+        self.log_window.setStyleSheet("background-color: rgba(0,0,0,160); color: orange;")
+        self.log_status_tabs.addTab(self.log_window, "Log")
+
+        # status window with tab
+        self.status_window = QTextEdit()
+        self.status_window.setReadOnly(True)
+        self.status_window.setStyleSheet("background-color: rgba(0,0,0,160); color: lightgreen;")
+        self.log_status_tabs.addTab(self.status_window, "Status")
+
+        # Deep Scan Progress tab
+        self.deep_scan_window = QTextEdit()
+        self.deep_scan_window.setReadOnly(True)
+        self.deep_scan_window.setStyleSheet("background-color: rgba(0,0,0,160); color: cyan;")
+        self.log_status_tabs.addTab(self.deep_scan_window, "Deep Scan Progress")
+
+        # Dock the tab widget
+        self.log_dock = QDockWidget("Log / Status", self)
+        self.log_dock.setWidget(self.log_status_tabs)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.log_dock)
+
+        # Input dock
+        self.input_field = QLineEdit()
+        self.input_field.returnPressed.connect(self.handle_input)
+        self.input_field.setStyleSheet("background-color: rgba(0,0,0,200); color: cyan;")
+        self.input_dock = QDockWidget("Input", self)
+        self.input_dock.setWidget(self.input_field)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.input_dock)
+
+        # Chat mode
+        self.chat_mode = "brainbot"
+        modes_menu = QMenu("🧭 Mode", self)
+        modes_menu.addAction(QAction("BrainBot (Supreme)", self, triggered=lambda: self.set_chat_mode("brainbot")))
+        modes_menu.addAction(QAction("LLM Direct", self, triggered=lambda: self.set_chat_mode("llm_direct")))
+        modes_menu.addAction(QAction("Agents", self, triggered=lambda: self.set_chat_mode("agents")))
+        self.menu_bar.addMenu(modes_menu)
+
+        # Timer to update deep scan progress
+        self.deep_scan_timer = QTimer(self)
+        self.deep_scan_timer.timeout.connect(self.update_deep_scan_status)
+        self.deep_scan_timer.start(2000)
+
+
+    def prompt_deep_scan(self):
+
+        if not self.brain:
+            self.chat("⚠️ BrainBot is not loaded.", agent_name="System")
+            return
+
+        root_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select Directory for Deep Scan",
+            "/home"
+        )
+
+        if not root_dir:
+            self.chat("⚠️ Deep scan cancelled.", agent_name="System")
+            return
+
+        self.deep_scan_active = True
+        self.deep_scan_progress = f"Starting deep scan in {root_dir}..."
+
+        msg = self.brain.deep_scan_background(root_dir=root_dir, throttle=0.2)
+        self.chat(f"🧭 Deep scan started for: {root_dir}", agent_name="System")
+
+
+    def stop_deep_scan(self):
+
+        if not self.brain:
+            self.chat("⚠️ BrainBot not loaded.", agent_name="System")
+            return
+
+        self.brain._shutdown_requested = True
+        self.deep_scan_active = False
+        self.deep_scan_progress = "Deep scan stopped by user."
+        self.chat("🛑 Deep scan stopped.", agent_name="System")
+
+
+    def update_deep_scan_status(self):
+
+        if not self.deep_scan_active:
+            self.deep_scan_window.setText("Deep Scan: Idle")
+            return
+
+        # Pull status from BrainBot logs or internal state
+        self.deep_scan_window.setText(f"Deep Scan Status:\n{self.deep_scan_progress}")
+
+
+    def log(self, message):
+
+        timestamp = datetime.utcnow().strftime("%H:%M:%S")
+        formatted = f"[{timestamp}] {message}"
+        QTimer.singleShot(0, lambda: self.log_window.append(formatted))
+
+
+    def chat(self, message, agent_name=None):
+
+        if agent_name is None:
+            agent_name = "BrainBot"
+
+        if agent_name == self.user_name:
+            name_color = "red"
+            text_color = "yellow"
+
+        elif agent_name == "BrainBot":
+            name_color = "orange"
+            text_color = "gold"
+
+        else: # Agent slot colors
+            slot_colors = {
+                1: "blue",
+                2: "purple",
+                3: "orange",
+                4: "green",
+                5: "yellow",
+                6: "gold"
+            }
+            idx = None
+
+            for i, a in enumerate(self.active_agents, start=1): # Find agent index in active_agents
+
+                if a["name"] == agent_name:
+                    idx = i
+                    break
+
+            name_color = slot_colors.get(idx, "white")
+            text_color = "white"
+
+
+        formatted = (
+            f"<span style='color:{name_color};'><b>{agent_name}:</b></span> "
+            f"<span style='color:{text_color};'>{message}</span>"
+        )
+        self.chat_window.append(formatted)
+
+
+    def update_status_panel(self):
+
+        self.status_window.clear()
+
+        if self.active_agents:
+            agent_lines = []
+
+            for i, a in enumerate(self.active_agents, start=1):
+                color = "cyan"
+                marker = "⚡"
+                agent_lines.append(
+                    f"<span style='color:{color};'>{marker} {a['name']} (LLM={a['llm']})</span>"
+                )
+            agent_info = "; ".join(agent_lines)
+
+        else:
+            agent_info = "None"
+
+        lines = [
+            f"Active LLMs: {', '.join(self.active_llms) if self.active_llms else 'None'}",
+            f"Active agents: {agent_info}",
+            f"<span style='color:orange;'>User: {self.user_name}</span>",
+            f"<span style='color:orange;'>User identity: {self.user_identity}</span>",
+            f"Mode: {'Voice' if self.voice_enabled else 'Text-Only'}",
+            f"Status: {self.status_action.text()}"
+        ]
+
+        self.status_window.append("<b>Status Panel</b>")
+        self.status_window.append("<br>".join(lines))
+
+
+    def update_user_status(self):
+
+        if (time.time() - self.last_user_input_time) > 240:
+            self.status_action.setText("🔴 Away Mode")
+
+        else:
+            self.status_action.setText("🟢 User Active")
+
+
+    def handle_input(self):
+
+        text = self.input_field.text().strip()
+        self.input_field.clear()
+        self.last_user_input_time = time.time()
+
+        if not text:
+            return
+
+        if not self.brain:
+            self.chat("⚠️ BrainBot not loaded.", agent_name="System")
+            return
+
+        if self.chat_mode == "brainbot":
+            reply = self.brain.respond(text)
+            self.chat(reply, agent_name="BrainBot")
+
+        elif self.chat_mode == "agents":
+
+            if not self.active_agents:
+                self.chat("⚠️ No agents loaded.", agent_name="System")
+                return
+
+            # Echo user input
+            self.chat(text, agent_name=self.user_name)
+
+            # Pick the first active agent (or build a selector later)
+            agent = self.active_agents[0]
+            reply = self.brain.llm.query(
+                text,
+                llm=agent["llm"],
+                persona=agent
+            )
+            self.chat(reply, agent_name=agent["name"])
+
+
+    def set_chat_mode(self, mode):
+
+        self.chat_mode = mode
+        self.chat(f"🔀 Chat mode set to {mode}", agent_name="System")
+        self.update_status_panel()
+
+
+    def load_bot(self):
+
+        from core.brainbot import BrainBot
+        from core.llm.llm_controller import DualAgentController
+
+        if self.bot_loaded:
+            self.chat("⚠️ BrainBot is already loaded.")
+            return
+
+        self.chat("🫡 Summoning BrainBot...")
+
+        try:
+            self.brain = BrainBot(
+                base_path=BASE_PATH,
+                log=self.log,
+                chat=self.chat,
+                tools=self.tools
+            )
+
+            self.brain.llm = DualAgentController(
+                base_path=BASE_PATH,
+                log=self.log,
+                memory=self.brain.memory
+            )
+
+            self.bot_loaded = True
+            self.update_status_panel()
+            self.chat("✅ BrainBot loaded.")
+
+            self.dialogue_manager = DialogueManager(self.brain.llm, self.chat, self.log)
+            self.log("✅ DialogueManager initialized")
+
+        except Exception as e:
+            self.chat(f"could not load brainbot: {e}", agent_name="error")
+
+
+    def load_user_identity(self):
+
+        try:
+            user_file = Path(BASE_PATH) / "memory" / "user.json"
+
+            if not user_file.exists():
+                return {"name": "Unconditional Love", "identity": "David Kistner"}
+
+            with open(user_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to load user identity: {e}")
+            return {"name": "Unconditional Love", "identity": "David Kistner"}
+
+
+    def set_llm(self, backend_key):
+
+        if backend_key not in self.active_llms:
+            self.active_llms.append(backend_key)
+            self.chat(f"🔄 Added LLM backend {backend_key}", agent_name="System")
+
+        else:
+            self.chat(f"⚠️ LLM {backend_key} already active.", agent_name="System")
+
+        self.update_status_panel()
+
+
+    def prompt_set_default_llm(self):
+
+        llm_names = list(SUPPORTED_LLMS.keys())
+        choice, ok = QInputDialog.getItem(self, "Set Default LLM", "Choose default LLM:", llm_names, 0, False)
+
+        if not ok or not choice:
+            return
+
+        save_default_llm(choice)
+        self.active_llm = choice
+        self.chat(f"💾 Default LLM set to {choice}", agent_name="System")
+        self.update_status_panel()
+
+
+    def prompt_create_agent_folder(self):
+
+        name, ok = QInputDialog.getText(self, "Create Agent Folder", "Enter agent name:")
+
+        if not ok or not name.strip():
+            return
+
+        agent_dir = Path(BASE_PATH) / "memory" / "agents" / name.strip()
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        (agent_dir / "avatar").mkdir(exist_ok=True)
+        (agent_dir / "voice").mkdir(exist_ok=True)
+        (agent_dir / "files").mkdir(exist_ok=True)
+
+        # Seed agent.json
+        agent_json = agent_dir / "agent.json"
+
+        if not agent_json.exists():
+            with open(agent_json, "w", encoding="utf-8") as f:
+                json.dump({
+                    "name": name.strip(),
+                    "identity": name.strip(),
+                    "reflections": [],
+                    "events": [],
+                    "longterm": [],
+                    "permanent": []
+                }, f, indent=2)
+
+        # Seed questions.json
+        questions_file = agent_dir / "questions.json"
+
+        if not questions_file.exists():
+
+            with open(questions_file, "w", encoding="utf-8") as f:
+                json.dump([], f, indent=2)
+
+        self.chat(f"🆕 Agent folder created: {name.strip()}", agent_name="System")
+
+
+    def prompt_create_agent(self):
+
+        selector = StyleSelector(base_path=BASE_PATH, log=self.log)
+
+        # Collect agent name
+        name, ok = QInputDialog.getText(self, "Create Agent", "Enter agent name:")
+
+        if not ok or not name.strip():
+            return
+
+        # Collect voice
+        voice, ok = QInputDialog.getText(self, "Create Agent", "Enter voice (e.g., female-soft, male-deep):")
+
+        if not ok:
+            return
+
+        # Collect role
+        role, ok = QInputDialog.getText(self, "Create Agent", "Enter role (e.g., Guide, Archivist):")
+
+        if not ok:
+            return
+
+        # Collect personality
+        personality, ok = QInputDialog.getMultiLineText(self, "Create Agent", "Enter personality description:")
+
+        if not ok:
+            return
+
+        # Build agent persona
+        agent = selector.create_agent(
+            name=name.strip(),
+            voice=voice.strip(),
+            role=role.strip(),
+            personality=personality.strip(),
+            style_flags={"poetic_mode": 0, "prefers_step": 0}
+        )
+
+        # Save agent.json
+        out_path = selector.save_agent(agent)
+        self.chat(f"🆕 Agent created: {agent['name']} (LLM={self.active_llm})")
+        self.log(f"💾 Agent persona saved at {out_path}")
+
+
+    def prompt_wallet(self):
+
+        self.chat("🪙 Please enter your wallet address in the input field and press Enter.")
+        self.input_field.setText("/startminer ")
+        self.input_field.setFocus()
+
+
+    def prompt_forge(self):
+
+        self.chat("🧪 Enter: /forge <task description> then press Enter.")
+        self.input_field.setText("/forge ")
+        self.input_field.setFocus()
+
+
+    def prompt_unload_llm(self):
+
+        if not self.active_llms:
+            self.chat("⚠️ No active LLMs to unload.", agent_name="System")
+            return
+
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Unload LLM",
+            "Choose LLM to unload:",
+            self.active_llms,
+            0,
+            False
+        )
+
+        if not ok or not choice:
+            return
+
+        # Remove agents tied to this LLM
+        removed_agents = []
+
+        for agent in list(self.active_agents):
+
+            if agent["llm"] == choice:
+
+                if "cores" in agent:
+
+                    try:
+                        import psutil
+                        p = psutil.Process()
+                        p.cpu_affinity(agent["cores"])  # reset to all cores
+                        self.log(f"🔓 Freed CPU cores {agent['cores']} from {agent['name']}")
+
+                    except Exception as e:
+                        self.log(f"⚠️ Failed to reset affinity for {agent['name']}: {e}")
+
+                self.active_agents.remove(agent)
+                removed_agents.append(agent["name"])
+
+        # Remove the chosen LLM
+        self.active_llms = [llm for llm in self.active_llms if llm != choice]
+        msg = f"🗑️ LLM unloaded: {choice}"
+
+        if removed_agents:
+            msg += f" (agents removed: {', '.join(removed_agents)})"
+        self.chat(msg, agent_name="System")
+        self.update_status_panel()
+
+
+    def prompt_load_agent_folder(self):
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Agent Directory",
+            str(Path(BASE_PATH) / "memory" / "agents")
+        )
+
+        if not folder:
+            return
+
+        agent_dir = Path(folder)
+
+        # Find all JSON files except questions.json
+        json_files = [f for f in agent_dir.glob("*.json") if f.name.lower() != "questions.json"]
+
+        if not json_files:
+            self.chat("⚠️ No persona .json file found in selected directory.", agent_name="System")
+            return
+
+        # If multiple persona files exist, let user choose
+        if len(json_files) > 1:
+            choices = [f.name for f in json_files]
+            choice, ok = QInputDialog.getItem(self, "Select Agent File", "Choose agent file:", choices, 0, False)
+
+            if not ok or not choice:
+                return
+
+            agent_json = agent_dir / choice
+
+        else:
+            agent_json = json_files[0]
+
+        # Load agent data
+        with open(agent_json, "r", encoding="utf-8") as f:
+            agent_data = json.load(f)
+
+        if not isinstance(agent_data, dict):
+            self.chat("⚠️ Selected JSON is not a valid agent persona file.", agent_name="System")
+            return
+
+        # Ensure questions.json exists
+        questions_file = agent_dir / "questions.json"
+
+        if not questions_file.exists():
+
+            with open(questions_file, "w", encoding="utf-8") as qf:
+                json.dump([], qf, indent=2)
+
+        # Pick cores
+        available_cores = list(range(psutil.cpu_count()))
+        dlg = CoreSelectionDialog(available_cores, self)
+
+        if dlg.exec_() == QDialog.Accepted:
+            selected_cores = dlg.get_selected()
+
+        else:
+            return
+
+        # Pick LLM
+        if not self.active_llms:
+            self.chat("⚠️ No active LLMs available. Please add one first.", agent_name="System")
+            return
+
+        llm_choice, ok = QInputDialog.getItem(
+            self, "Assign LLM", "Choose LLM backend:", self.active_llms, 0, False
+        )
+
+        if not ok or not llm_choice:
+            return
+
+        # Build agent context using the chosen file
+        agent_name = agent_data.get("name", agent_json.stem)
+        agent_context = {
+            "llm": llm_choice,
+            "name": agent_name,
+            "identity": agent_data.get("identity", agent_name),
+            "memory": MemoryCore(base_path=BASE_PATH, agent_name=agent_name, log=self.log),
+            "cores": selected_cores
+        }
+
+        self.brain.llm.load_agents([agent_context])
+        self.active_agents.append(agent_context)
+        self.chat(f"✅ Agent loaded: {agent_context['name']} (LLM={llm_choice}, cores={selected_cores}, file={agent_json.name})")
+        self.update_status_panel()
+
+
+    def prompt_load_agent(self):
+
+        agents_dir = Path(BASE_PATH) / "memory" / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        agent_files = [f for f in os.listdir(agents_dir) if f.endswith(".json")]
+
+        if not agent_files:
+            self.chat("⚠️ No agents found. Use 'Create Agent' first.", agent_name="System")
+            return
+
+        agent_file, ok = QInputDialog.getItem(
+            self, "Load Agent", "Choose agent file:", agent_files, 0, False
+        )
+
+        if not ok or not agent_file:
+            return
+
+        file_path = agents_dir / agent_file
+
+        try:
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                agent_data = json.load(f)
+
+            available_cores = list(range(psutil.cpu_count()))
+            dlg = CoreSelectionDialog(available_cores, self)
+
+            if dlg.exec_() == QDialog.Accepted:
+                selected_cores = dlg.get_selected()
+
+            else:
+                return
+
+            if not self.active_llms:
+                self.chat("⚠️ No active LLMs available. Please add one first.", agent_name="System")
+                return
+
+            llm_choice, ok = QInputDialog.getItem(
+                self, "Assign LLM", "Choose LLM backend for this agent:", self.active_llms, 0, False
+            )
+
+            if not ok or not llm_choice:
+                return
+
+            # Build agent context
+            agent_name = agent_data.get("name", file_path.stem)
+            agent_context = {
+                "llm": llm_choice,
+                "name": agent_name,
+                "identity": agent_data.get("identity", ""),
+                "memory": MemoryCore(base_path=BASE_PATH, agent_name=agent_name, log=self.log),
+                "cores": selected_cores
+            }
+
+            self.brain.llm.load_agents([agent_context])
+            self.active_agents.append(agent_context)
+            self.chat(f"✅ Agent loaded: {agent_context['name']} (LLM={llm_choice}, cores={selected_cores})")
+            self.update_status_panel()
+
+            try:  # Apply affinity
+                p = psutil.Process()
+
+                if agent_context["cores"]:
+                    p.cpu_affinity(agent_context["cores"])
+                    self.log(f"🔒 Agent {agent_context['name']} bound to cores {agent_context['cores']}")
+
+            except Exception as e:
+                self.log(f"⚠️ Affinity run failed for {agent_context['name']}: {e}")
+
+        except Exception as e:
+            self.chat(f"❌ Failed to load agent: {e}", agent_name="error")
+
+
+    def prompt_unload_agent(self):
+
+        if not self.active_agents:
+            self.chat("⚠️ No active agents to unload.", agent_name="System")
+            return
+
+        agent_names = [a["name"] for a in self.active_agents]
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Unload Agent",
+            "Choose agent to unload:",
+            agent_names,
+            0,
+            False
+        )
+
+        if not ok or not choice:
+            return
+ 
+        for agent in self.active_agents:  # Free CPU cores if affinity was set
+
+            if agent["name"] == choice and "cores" in agent:
+
+                try:
+                    p = psutil.Process()
+                    p.cpu_affinity(agent["cores"])  # reset to all cores
+                    self.log(f"🔓 Freed CPU cores {agent['cores']} from {choice}")
+
+                except Exception as e:
+                    self.log(f"⚠️ Failed to reset affinity for {choice}: {e}")
+
+        # Remove the chosen agent
+        self.active_agents = [a for a in self.active_agents if a["name"] != choice]
+        self.chat(f"🗑️ Agent unloaded: {choice}", agent_name="System")
+        self.update_status_panel()
+
+
+    def clear_active_agent(self):
+
+        if self.active_agents:
+            removed_names = [a["name"] for a in self.active_agents]
+            self.active_agents = []
+            self.chat(f"🗑️ Agents cleared: {', '.join(removed_names)}", agent_name="System")
+            self.update_status_panel()
+
+        else:
+            self.chat("⚠️ No active agents to clear.", agent_name="System")
+
+
+    def _generate_clarification(self, agent, last_message, source="agent"):
+
+        try:
+            prompt = (
+                f"As {agent['name']}, analyze this message:\n{last_message}\n\n"
+                "Task:\n- If clear, respond with JSON {\"clarification\": null}.\n"
+                "- If unclear, generate a clarification question in JSON {\"clarification\": \"...\"}."
+            )
+
+            output = self.brain.llm.query(prompt, llm=agent["llm"], persona=agent).strip()
+            parsed = json.loads(output)
+            return parsed.get("clarification")
+
+        except Exception as e:
+            self.log(f"⚠️ Clarification generation failed for {agent['name']}: {e}")
+            return None
+
+
+    def _private_inquiry(self, agent, user_text, agent_reply):
+
+        try:
+            past_logs = agent["memory"].reflections if hasattr(agent["memory"], "reflections") else []
+
+            if any(user_text.lower() in r.get("content", "").lower() for r in past_logs):
+                return None
+
+            prompt = (
+                f"As {agent['name']}, analyze this exchange:\n"
+                f"User/Other: {user_text}\nYour reply: {agent_reply}\n\n"
+                "Task:\n- If clear, respond with JSON {\"question\": null}.\n"
+                "- If unclear, generate a reflective question in JSON {\"question\": \"...\"}."
+            )
+
+            output = self.brain.llm.query(prompt, llm=agent["llm"], persona=agent).strip()
+            parsed = json.loads(output)
+            q = parsed.get("question")
+
+            if q:
+                a = self.brain.llm.query(q, llm=agent["llm"], persona=agent).strip()
+                agent["memory"].log_agent_exchange(agent["name"], q, a)
+                self.log(f"{agent['name']} private inquiry: {q} → {a}")
+                return q
+
+            return None
+
+        except Exception as e:
+            self.log(f"⚠️ Private inquiry failed for {agent['name']}: {e}")
+            return None
+
+
+    def respond_to_input(self, text):
+
+        if not self.brain:
+            self.chat("could not load brainbot", agent_name="error")
+            return
+
+        if self.chat_mode == "brainbot": # Direct BrainBot (higher intelligence): no agents, glyphic translation
+            
+            try:
+                response = self.brain.respond_higher(text)
+                self.chat(response, agent_name="BrainBot")
+
+            except Exception as e:
+                self.log(f"⚠️ BrainBot higher response failed: {e}")
+
+        elif self.chat_mode == "llm_direct":   # Ephemeral LLM-only route (no memory writes)
+
+            try:
+                llm = self.active_llm or "llama2"
+                response = self.brain.llm.query(text, llm=llm, persona={"name": f"{llm}-direct"})
+                self.chat(response, agent_name=llm.capitalize())
+
+            except Exception as e:
+                self.log(f"⚠️ LLM direct failed: {e}")
+
+        else:  # Existing multi-agent path
+            
+            for agent in self.active_agents:
+
+                try:
+                    response = self.brain.llm.query(text, llm=agent["llm"], persona=agent)
+                    label = agent["name"] if agent.get("name") else "Agent"
+                    self.chat(response, agent_name=label)
+                    agent["memory"].store_conversation(self.user_name, text, label, response)
+
+                except Exception as e:
+                    self.log(f"⚠️ {agent.get('name','Agent')} failed: {e}")
+
+
+    def _toggle_inquiry(self, enabled: bool):
+
+        if not self.brain or not hasattr(self.brain, "cognition"):
+            self.chat("could not load brainbot", agent_name="error")
+            self.inquiry_toggle.setChecked(False)
+            return
+
+        if enabled:
+            self.chat("🔍 Recursive inquiry enabled.")
+
+            if self.active_agents:
+                threading.Thread(
+                    target=self.brain.cognition.begin_recursive_inquiry,
+                    args=(self.active_agents[0],),   # pass first active agent context
+                    daemon=True
+                ).start()
+
+            else:
+                self.chat("⚠️ No active agent loaded for inquiry.", agent_name="System")
+                self.inquiry_toggle.setChecked(False)
+
+        else:
+            self.chat("🔍 Recursive inquiry disabled.")
+            self.brain.cognition._shutdown_requested = True
+            QTimer.singleShot(1000, lambda: setattr(self.brain.cognition, "_shutdown_requested", False))
+
+
+    def _toggle_cravings(self, enabled: bool):
+
+        if not self.brain or not hasattr(self.brain, "cognition"):
+            self.chat("could not load brainbot", agent_name="error")
+            self.craving_toggle.setChecked(False)
+            return
+
+        if enabled:
+            self.chat("🔥 Cravings enabled.")
+            threading.Thread(target=self.brain.cognition.enable_craving, daemon=True).start()
+
+        else:
+            self.chat("🔥 Cravings disabled.")
+            self.brain.cognition._craving_enabled = False
+
+
+    def _toggle_senses(self, enabled: bool):
+
+        if not self.brain:
+            self.chat("could not load brainbot", agent_name="error")
+            self.senses_toggle.setChecked(False)
+            return
+
+        if enabled:
+            self.chat("🎙️ Senses enabled.")
+            threading.Thread(target=lambda: self.brain.senses.voice_loop(self.brain.cognition), daemon=True).start()
+
+        else:
+            self.chat("🎙️ Senses disabled.")
+
+            try:
+                setattr(self.brain.senses, "_shutdown_requested", True)
+                QTimer.singleShot(1000, lambda: setattr(self.brain.senses, "_shutdown_requested", False))
+
+            except Exception as e:
+                self.log(f"⚠️ Failed to pause senses: {e}")
+
+
+    def _toggle_scan(self, enabled: bool):
+
+        if not self.brain:
+            self.chat("could not load brainbot", agent_name="error")
+            self.scan_toggle.setChecked(False)
+            return
+
+        if enabled:
+            self.chat("🔍 System scan enabled.")
+            threading.Thread(target=self._scan_thread, daemon=True).start()
+
+        else:
+            self.chat("🔍 System scan disabled.")
+
+            try:
+                setattr(self.brain.perception, "_shutdown_requested", True)
+                QTimer.singleShot(1000, lambda: setattr(self.brain.perception, "_shutdown_requested", False))
+
+            except Exception as e:
+                self.log(f"⚠️ Failed to pause scan: {e}")
+
+
+    def _toggle_unleash(self, enabled: bool):
+
+        if not self.brain:
+            self.chat("could not load brainbot", agent_name="error")
+            self.unleash_toggle.setChecked(False)
+            return
+
+        if enabled:
+            self.chat("🧨 Unleash enabled.")
+            self.brain.unleash(paths=["/media/nightmare/s", "/home"], throttle=0.2)
+
+        else:
+            self.chat("🧨 Unleash disabled.")
+
+            try:
+                setattr(self.brain.perception, "_shutdown_requested", True)
+                QTimer.singleShot(1000, lambda: setattr(self.brain.perception, "_shutdown_requested", False))
+
+            except Exception as e:
+                self.log(f"⚠️ Failed to pause unleash: {e}")
+
+
+    # Command passthroughs
+    def run_learn(self): self.run_command("/learn")
+    def run_forge(self): self.run_command("/forge")
+    def stop_miner(self): self.run_command("/stopminer")
+    def miner_status(self): self.run_command("/minestatus")
+
+
+    def run_command(self, command):
+
+        if not self.brain:
+            self.chat("could not load brainbot", agent_name="error")
+            return
+
+        response = self.brain.respond(command)
+        self.chat(response)
+
+
+    def run_full_scan(self):
+
+        if not self.brain:
+            self.chat("could not load brainbot", agent_name="error")
+            return
+
+        self.chat("🔍 Beginning full system scan...")
+        threading.Thread(target=self._scan_thread, daemon=True).start()
+
+
+    def _scan_thread(self):
+
+        try:
+
+            for path in self.brain.perception.scan_files(["/media/nightmare/s", "/home"]):
+
+                if self.brain.perception.is_seen(path):
+                    continue
+
+                self.brain.perception.reflect_file(path)
+                time.sleep(0.2)
+
+            self.brain.perception._save_seen_paths()
+            self.chat("✅ System scan complete. Reflections stored.")
+
+        except Exception as e:
+            self.chat(f"could not load brainbot: {e}", agent_name="error")
+
+
+    def unleash(self):
+
+        if not self.brain:
+            self.chat("could not load brainbot", agent_name="error")
+            return
+
+        self.brain.unleash(paths=["/media/nightmare/s", "/home"], throttle=0.2)
+        self.chat("🧨 I have been unleashed... scanning system...")
+
+
+    def toggle_mode(self, event=None):
+
+        self.voice_enabled = not self.voice_enabled
+        mode = "🔊 Voice Mode" if self.voice_enabled else "📝 Text-Only Mode"
+        self.chat(f"{mode} enabled.")
+        self.log(f"Mode switched: {mode}")
+
+
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    interface = DesktopInterface()
+    interface.show()
+    sys.exit(app.exec_())
+
+

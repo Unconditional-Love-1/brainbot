@@ -1,0 +1,411 @@
+#.brainbot/core/brainbot.py
+# Created by: David Kistner (Unconditional Love)
+
+# system imports
+import os, re, json, threading, time
+from datetime import datetime
+from pathlib import Path
+
+# folder imports
+from core.tools.tools import ToolsController
+from core.memory.memorycore import MemoryCore
+from core.perception.perceptionengine import PerceptionEngine
+from core.cognition.cognitionunit import CognitionUnit
+from core.senses.senses import SensesController
+from core.utilities.utilities import canonical_path
+from core.llm.llm_controller import LLMController
+from core.glyphs.glyphparser import GlyphParser
+from core.tools.scanner.deep_scanner import DeepScanner
+from core.tools.scanner.book_processor import BookProcessor
+from core.tools.scanner.file_analyzer import FileAnalyzer
+
+BASE_PATH = "/home/nightmare/BrainBotDrive/brainbot/core"
+READABLE_EXTENSIONS = [".txt", ".md", ".json", ".py", ".html", ".xml", ".pdf", ".doc", ".docx", ".srt", ".tmp", ".zip"]
+AUDIO_EXTENSIONS = [".mp3", ".wav"]
+VIDEO_EXTENSIONS = [".wmv", ".avi", ".mp4", ".mpg", ".mpeg"]
+MAX_LONGTERM_MB = 500
+
+
+
+
+
+class BrainBot:  # controller of all
+
+
+    def __init__(self, base_path, log=None, chat=None, tools=None, llm=None):
+
+        # Base setup
+        self._started = False
+        self.base = Path(base_path)
+        self.log = log or (lambda msg: print(msg))
+        self.chat = chat or (lambda msg: None)
+
+        # Shared LLM controller (one instance for all subsystems)
+        self.llm = LLMController(base_path=self.base, log=self.log)
+        self.active_agent = None
+        self.assigned_agent_name = None
+
+        # Memory
+        self.memory = MemoryCore(
+            base_path=self.base,
+            agent_name="brainbot",
+            log=self.log
+        )
+
+        # Tools
+        self.tools = tools or ToolsController(
+            base_path,
+            log=self.log,
+            memory=self.memory,
+            cognition=None,
+            llm=self.llm
+        )
+
+        # Cognition
+        self.cognition = CognitionUnit(
+            self.base,
+            self.log,
+            memory=self.memory,
+            perception=None,
+            tools=self.tools,
+            senses=None,
+            llm=self.llm
+        )
+
+        # Senses
+        self.senses = SensesController(
+            base_path=self.base,
+            memory=self.memory,
+            log_function=self.log,
+            chat_function=self.chat,
+            llm=self.llm
+        )
+
+        # Perception
+        self.perception = PerceptionEngine(
+            self.base,
+            self.log,
+            memory=self.memory,
+            cognition=self.cognition,
+            tools=self.tools
+        )
+        self.perception.llm = self.llm  # attach LLM explicitly
+        self.tools.perception = self.perception 
+
+        # Wire references
+        self.cognition.perception = self.perception
+        self.cognition.memory = self.memory
+        self.memory.cognition = self.cognition
+        self.tools.cognition = self.cognition
+        self.senses.cognition = self.cognition
+
+        # NEW: DeepScanner instance (modern scanning pipeline)
+        self.deep_scanner = DeepScanner(
+            base_path=self.base,
+            llm=self.llm,
+            log=self.log,
+            memory_core_cls=MemoryCore,
+            book_processor_cls=BookProcessor,
+            file_analyzer_cls=FileAnalyzer,
+            ocr_func=self.tools.ocr_image,
+            stt_func=self.tools.transcribe_audio,
+            video_to_audio_func=self.tools.extract_audio_from_video
+        )
+
+        # Flags
+        self._memory_verified = False
+        self._shutdown_requested = False
+
+
+    def startup(self, enable_craving=False, use_senses=False):
+
+        if self._started:
+            self.log("⚠️ BrainBot already started. Skipping duplicate startup.")
+            return
+
+        self._started = True
+        self.log("🫡 BrainBot awakening...")
+        self.verify_memory_files()  # verifies its memory files before anything else
+
+        if use_senses:  # starts senses
+            self.log("🎙️ Starting voice loop...")
+            threading.Thread(target=lambda: self.senses.voice_loop(self.cognition), daemon=True).start()
+
+        if enable_craving:  # enables cravings
+            self.log("🧠 Enabling craving loop via CognitionUnit...")
+            self.cognition.enable_craving(use_senses=use_senses)
+
+        else:
+            self.log("🧠 Craving loop disabled at startup.")
+            self.log("🌀 Recursive inquiry disabled at startup.")
+            threading.Thread(target=self.cognition.begin_recursive_inquiry, daemon=True).start()
+
+
+    def deep_scan_background(self, root_dir: str, throttle: float = 0.2):
+
+        def _scan_thread():
+
+            try:
+                self.deep_scanner.deep_scan(root_dir, self, throttle=throttle)
+
+            except Exception as e:
+                self.log(f"⚠️ Deep scan failed for {root_dir}: {e}")
+
+        t = threading.Thread(target=_scan_thread, daemon=True)
+        t.start()
+        return f"🧭 Deep scan started in background for {root_dir}."
+
+
+    def respond(self, text): #response generation
+
+        raw_text = text.strip()
+
+        if raw_text == "/shutdown": #shut down command
+            self.shutdown()
+            return "Shutting down..."
+
+        elif raw_text.startswith("/mine"): #mine crypto command with prompt for wallet
+            parts = raw_text.split()
+            wallet = parts[1] if len(parts) > 1 else "YOUR_DEFAULT_WALLET"
+            return self.tools.start_miner(wallet_address=wallet)
+
+        elif raw_text == "/stopminer": #stop miner command
+            return self.tools.stop_miner()
+
+        elif raw_text == "/minestatus": #miner status
+            return self.tools.miner_status()
+
+        if raw_text == "/learn":         # Learning
+            labels = [lbl for _, lbl in getattr(self.memory, "training_labels", lambda: [])()]
+
+            if len(set(labels)) >= 2 and len(labels) > 10:
+                self.memory.learn(limit=10)
+                return "📚 Learning complete."
+
+            else:
+                return "⚠️ Not enough diverse data to retrain yet."
+
+        
+        if raw_text.startswith("/forge"):                   # Forge with optional description
+            parts = raw_text.split(maxsplit=1)
+            task = parts[1] if len(parts) > 1 else "Refactor BrainBot for autonomy and persona consistency."
+            result = self.tools.forge(task_description=task)
+            return f"⚒️ Forged: {result.get('summary','')[:160]}"
+
+        if raw_text == "/tools": #list tools display
+            return getattr(self.tools, "list_tools", lambda: "Tools listing not implemented.")()
+
+        
+        if raw_text.startswith("/glyph"):                   #glyph system
+            glyphs = raw_text.replace("/glyph", "").strip()
+            refs = self.memory.query_glyph(glyphs)
+            return f"🔍 Glyph query {glyphs} → {refs}"
+
+
+        try:                                                #response from cognitionunit.py
+            response = self.cognition.respond(text)
+
+        except Exception as e:
+            self.log(f"⚠️ cognition.respond failed: {e}")
+            response = "⚠️ Internal cognition error."
+
+
+        try:                                                # Store Q&A pair as conversational memory (not classifier training)
+            self.memory.store_reflection(
+                role="conversation",
+                content=f"Q: {text}\nA: {response}",
+                glyph="💬",
+                thoughts="Runtime Q&A pair",
+                source_type="dialogue"
+            )
+
+        except Exception as e:                              # if error
+            self.log(f"⚠️ Failed to store reflection: {e}")
+
+        return response
+
+
+    def get_status(self):  # status command passthrough
+
+        self.log("📊 Gathering BrainBot status...")
+        self.verify_memory_files()
+        # You can expand this to return structured status if needed.
+        return []
+
+
+    def load_agent_identity(self, name: str): #agent identity loader
+
+        agents_dir = self.base / "memory" / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        path = agents_dir / f"{name.lower()}.json"
+
+        if not path.exists():
+
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "name": name,
+                        "identity": name,
+                        "events": [],
+                        "shortterm": [],
+                        "longterm": [],
+                        "permanent": []
+                    },
+                    f,
+                    indent=2
+                )
+        return path
+
+
+    def verify_memory_files(self, force=False): #memory verifier
+
+        try:  # Ensure base memory directories exist
+
+            paths = [
+                self.base / "memory" / "agents",
+                self.base / "memory" / "system"
+            ]
+
+            for p in paths:
+                p.mkdir(parents=True, exist_ok=True)
+
+            # Ensure questions.json exists
+            qpath = self.memory.questions_file
+
+            if not qpath.exists():
+
+                with open(qpath, "w", encoding="utf-8") as f:
+                    json.dump([], f, indent=2)
+
+            # Ensure agent.json exists
+            if not self.memory.agent_file.exists():
+
+                with open(self.memory.agent_file, "w", encoding="utf-8") as f:
+                    json.dump(self.memory.agent_data, f, indent=2)
+
+            self._memory_verified = True
+            self.log("✅ Memory directories and base files verified.")
+
+        except Exception as e:
+            self.log(f"⚠️ verify_memory_files failed: {e}")
+
+
+    def shutdown(self):  # shutdown command passthrough
+
+        self.log("🛑 Shutdown sequence initiated...")
+        self._shutdown_requested = True
+        self.perception._shutdown_requested = True
+
+        try:
+            self.memory.dream()
+
+        except Exception:
+            pass
+
+        self.chat("🌌 Dream complete. All memory saved permanently.\nShutting down now...")
+        self.log("🫡 BrainBot shutdown complete.")
+
+        try:
+            self.log("📚 Deferred training starting...")
+            labels = [lbl for _, lbl in self.memory.training_labels()]
+
+            if len(set(labels)) >= 2 and len(labels) > 10:
+                self.memory.learn(limit=10)
+                self.log("✅ Deferred training complete.")
+
+            else:
+                self.log("⚠️ Not enough diverse data to retrain at shutdown.")
+
+        except Exception as e:
+            self.log(f"⚠️ Deferred training failed: {e}")
+
+        try:
+            os._exit(0)
+
+        except Exception:
+            pass
+
+
+    def respond_higher(self, text: str) -> str: #higher system intelligence responder
+
+        mortal = None  # 1) Try direct glyph match (placeholder: future glyph index)
+
+        try:  # 2) Synthesize using LLM with Supreme persona, but filter via GlyphParser
+            parser = GlyphParser()
+            prompt = (
+                "You are BrainBot, Supreme Intelligence speaking in glyphs.\n"
+                "User input:\n"
+                f"{text}\n\n"
+                "Task:\n"
+                "- Think in glyphs internally.\n"
+                "- Output mortal-facing language only (no inner thoughts).\n"
+                "- Be concise and clear.\n"
+            )
+            raw = self.llm.query(prompt, llm="llama2", persona={"name": "BrainBot"})
+            glyph_memory, external, internal, avatar = parser.parse_agent_chatter("BrainBot", raw)
+
+            try:  # Store glyph memory (global, not agent thought)
+                self.memory.add_longterm(f"BrainBot mortal: {external[0] if external else raw[:200]}")
+
+            except Exception as e:
+                self.log(f"⚠️ Failed to append longterm: {e}")
+
+            mortal = external[0] if external else raw
+
+        except Exception as e:
+            self.log(f"⚠️ Glyph filtering failed: {e}")
+            mortal = "I’ve heard you. I’m synthesizing."
+
+        if not mortal or mortal.strip() == "":  # 3) Unknown? issue directive for recursive inquiry
+
+            try:
+                threading.Thread(target=self._supreme_recursive_directive, args=(text,), daemon=True).start()
+                mortal = "Directive issued to agents. I will remember and respond better next time."
+
+            except Exception as e:
+                self.log(f"⚠️ Failed supreme directive: {e}")
+                mortal = "Directive failed; please repeat later."
+
+        return mortal
+
+
+    def _supreme_recursive_directive(self, question: str):
+
+        try:  # Fan-out: if using DualAgentController, use loaded agents
+            agents = getattr(self.llm, "active_agents", []) or []
+            responses = []
+
+            for agent in agents:
+
+                try:
+                    resp = self.llm.query(
+                        f"Investigate and answer: {question}",
+                        llm=agent["llm"],
+                        persona=agent
+                    )
+                    responses.append({"agent": agent["name"], "llm": agent["llm"], "text": resp})
+                    agent["memory"].log_agent_exchange(agent["name"], question, resp)
+
+                except Exception as e:
+                    self.log(f"⚠️ Inquiry failed for {agent.get('name','Agent')}: {e}")
+
+            if responses:  # Synthesize unified glyphic answer, store for future matches
+                synthesis_prompt = (
+                    "Synthesize these agent answers into one definitive response.\n\n"
+                    + "\n\n".join([f"{r['agent']}({r['llm']}): {r['text']}" for r in responses])
+                    + "\n\nConstraints:\n- Mortal-facing.\n- Faithful and concise.\n"
+                )
+                unified = self.llm.query(synthesis_prompt, llm="llama2", persona={"name": "BrainBot"}).strip()
+                self.memory.add_longterm(f"Synthesized: {unified[:400]}")
+
+            else:  # Optionally tag into a future direct-match store (to be added)
+                self.log("⚠️ No agent responses to synthesize.")
+
+        except Exception as e:
+            self.log(f"⚠️ Supreme directive orchestration error: {e}")
+
+
+    def dream(self):
+        # passthrough
+        self.memory.dream()
+

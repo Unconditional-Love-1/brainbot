@@ -1,0 +1,21 @@
+#.brainbot\core\retrieval\reranker.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+#system imports
+import difflib
+
+
+
+
+def score(item, query):
+
+    sim = difflib.SequenceMatcher(None, query.lower(), item['input'].lower()).ratio()
+    recency = 1.0 / (1 + item.get('age_days', 0))
+    trust = item.get('trust', 0.5)
+    return 0.6*sim + 0.3*recency + 0.1*trust
+
+def rerank(candidates, query):
+
+    return sorted(candidates, key=lambda c: score(c, query), reverse=True)

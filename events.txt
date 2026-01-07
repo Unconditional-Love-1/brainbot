@@ -1,0 +1,18 @@
+#.brainbot\core\feedback\events.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+#system imports
+from dataclasses import dataclass
+
+
+
+
+@dataclass
+class Outcome:
+
+    kind: str     # "response", "clarify", "retrieval", "tts"
+    ok: bool      # success heuristic
+    meta: dict    # features, confidence, timings
+    ts: str

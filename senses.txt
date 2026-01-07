@@ -1,0 +1,218 @@
+#.brainbot/core/senses/senses.py
+# Created by: David Kistner (Nightmare, Obscurus, Unconditional Love)
+
+
+
+
+#system imports
+import threading, time, json
+from pathlib import Path
+from datetime import datetime
+#folder imports
+from .video.video_sense import VideoController
+from .audio.audio_sense import AudioController
+from core.utilities.utilities import cleanup_raw_media
+from core.llm.llm_controller import LLMController
+
+EMOTION_EMOJI = {
+    "joy": "😊",
+    "sadness": "😢",
+    "anger": "😠",
+    "awe": "🤯",
+    "fear": "😨",
+    "love": "❤️",
+    "neutral": "😐"
+}
+
+
+
+
+class SensesController:  # Audio, Video, Interpreter, Screen Sense
+
+    def __init__(self, base_path, memory=None, log_function=None, chat_function=None, llm=None):
+
+        self.log = log_function or (lambda msg: print(msg))
+        self.base_path = Path(base_path)
+        self.audio = AudioController(log_function=self.log)
+        self.video = VideoController(base_path=self.base_path, log_function=self.log)
+        self.memory = memory
+        self.chat = chat_function
+        self.llm = llm
+
+    def _llm_interpret(self, modality, content):    # --- Core LLM interpretation ---
+
+        summary, emotion, questions = content[:100], "neutral", []
+
+        if hasattr(self.memory, "cognition") and getattr(self.memory.cognition, "llm", None):
+
+            try:
+                agent_for_llm = getattr(self.memory, "active_agent", None) or "llama2"
+                agent_name = getattr(self.memory, "assigned_agent_name", "Agent")
+
+                prompt = (
+                    f"You are the active agent ({agent_for_llm}) interpreting a {modality} input as {agent_name}.\n\n"
+                    f"Raw content:\n{content}\n\n"
+                    "Task:\n"
+                    "- Summarize meaning in 2–3 sentences.\n"
+                    "- Classify dominant emotion (joy, sadness, anger, awe, fear, love, neutral).\n"
+                    "- Generate 2 symbolic questions.\n"
+                    "Respond in JSON with keys: summary, emotion, questions."
+                )
+                llm_output = self.memory.cognition.llm.query(prompt, agent=agent_for_llm).strip()
+                parsed = json.loads(llm_output)
+                summary = parsed.get("summary", summary)
+                emotion = parsed.get("emotion", emotion)
+                questions = parsed.get("questions", [])
+
+            except Exception as e:
+                self.log(f"⚠️ LLM interpretation failed: {e}")
+        return summary, emotion, questions
+
+    def _glyph_for(self, modality):
+
+        return {
+            "audio": "🎙️",
+            "camera_image": "📸",
+            "camera_video": "🎥",
+            "screen": "🖥️",
+            "text": "📝"
+        }.get(modality, "🔍")
+
+    def _store(self, modality, data):
+
+        # Extract readable content
+        if modality in ("screen", "text"):
+            content = data.get("text", "(no text)")
+
+        elif modality == "camera_image":
+            content = data.get("path", data.get("message", "image event"))
+
+        elif modality == "camera_video":
+            content = f"{data.get('path','video event')} ({data.get('duration','?')}s)"
+
+        elif modality == "audio":
+            content = data.get("text", data.get("message", "audio event"))
+
+        else:
+            content = str(data)
+
+        # Run through Luna’s LLM
+        summary, emotion, questions = self._llm_interpret(modality, content)
+
+        packet = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "modality": modality,
+            "data": data,
+            "summary": summary,
+            "emotion": emotion,
+            "questions": questions
+        }
+
+        # Store reflection
+        if self.memory:
+
+            try:
+                self.memory.store_reflection(
+                    role=modality,
+                    content=content,
+                    glyph=self._glyph_for(modality),
+                    thoughts=summary,
+                    source_type=modality,
+                    emotion=emotion,
+                    important=(emotion not in ["neutral"])  # auto-flag strong emotions
+                )
+
+            except Exception as e:
+                self.log(f"⚠️ Failed to store reflection: {e}")
+
+        return packet
+
+
+    def sense_screen(self, ocr=True):    # --- Sense methods ---
+
+        self.log("🖥️ Sensing screen...")
+        result = self.video.record_screen(ocr=ocr)
+        return self._store("screen", result)
+
+    def sense_camera_image(self, save_path=None):
+
+        self.log("📸 Sensing webcam image...")
+        result = self.video.capture_webcam_image(save_path=save_path)
+        return self._store("camera_image", result)
+
+    def sense_camera_video(self, duration=10, save_path=None):
+
+        save_path = save_path or self.base_path / "memory" / "video"
+        self.log(f"🎥 Sensing webcam video ({duration}s)...")
+        result = self.video.capture_webcam_video(duration=duration, save_path=str(save_path))
+        return self._store("camera_video", result)
+
+    def sense_audio(self, timeout=5, phrase_time_limit=10):
+
+        self.log("🎙️ Sensing audio...")
+
+        try:
+            result = self.audio.listen_and_transcribe(timeout=timeout, phrase_time_limit=phrase_time_limit)
+            return self._store("audio", result)
+
+        except Exception as e:
+            self.log(f"⚠️ Audio sensing failed: {e}")
+            return None
+
+    def interpret(self, source="text", content=None):
+
+        if source == "audio":
+            result = self.sense_audio(timeout=5, phrase_time_limit=10)
+            return result.get("summary", "") if result else ""
+
+        elif source == "video":
+            result = self.sense_screen(ocr=True)
+            return result.get("summary", "") if result else ""
+
+        elif source == "text" and content:
+            packet = {"text": content}
+            return self._store("text", packet).get("summary", content)
+
+        else:
+            self.log("⚠️ Unknown input source or missing content.")
+            return ""
+
+    def stream_senses(self, interval=30):
+
+        def stream():
+            self.log("🌌 Sensory stream initiated...")
+
+            while True:
+
+                try:
+                    self.sense_screen()
+                    self.sense_camera_image()
+                    self.sense_camera_video()
+                    self.sense_audio()
+                    cleanup_raw_media(self.base_path / "memory" / "video", log=self.log)
+                    time.sleep(interval)
+
+                except Exception as e:
+                    self.log(f"❌ Sensory stream error: {e}")
+                    time.sleep(interval)
+        threading.Thread(target=stream, daemon=True).start()
+
+    def voice_loop(self, cognition, timeout=5, phrase_time_limit=10):
+
+        self.log("🎙️ Voice loop started...")
+
+        while True:
+            transcript_data = self.audio.listen_and_transcribe(timeout=timeout, phrase_time_limit=phrase_time_limit)
+            text = transcript_data.get("text", "")
+
+            if not text or text.startswith("("):
+                continue
+            self.log(f"🎧 Heard: {text}")
+            response = cognition.respond(text, source="voice")
+
+            if response:
+                self.audio.synthesize_speech(response)
+
+                if self.chat:
+                    self.chat(response)
+

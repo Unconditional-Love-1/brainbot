@@ -1,0 +1,274 @@
+# .brainbot/core/scanner/book_processor.py
+# Created by: David Kistner (Unconditional Love)
+
+
+
+
+
+#system imports
+import re, os, json
+from datetime import datetime
+from pathlib import Path
+
+
+
+
+
+class BookProcessor:
+
+
+    def __init__(self, base_path, llm, log):
+
+        self.base = Path(base_path)
+        self.llm = llm
+        self.log = log or (lambda msg: print(msg))
+
+
+    def _sanitize_title_for_fs(self, title: str) -> str:
+
+        if not title:
+            return "Unknown Title"
+
+        # preserve punctuation except illegal FS chars
+        illegal = r'[\/:*?"<>|]'
+        return re.sub(illegal, " ", title).strip() or "Unknown Title"
+
+
+    def _book_folder(self, agent_name: str, title: str, filename: str) -> Path:
+
+        safe_title = self._sanitize_title_for_fs(title)
+        folder_name = f"{safe_title} ({filename})"
+        folder = self.base / "memory" / "agents" / agent_name / "books" / folder_name
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+
+    def _segment_text(self, text: str) -> list:
+
+        segments = []
+        chapter_splits = re.split(r"(CHAPTER\s+\d+|Chapter\s+\d+|##\s+Chapter.*)", text)
+
+        if len(chapter_splits) > 1:
+            current_label = None
+            buffer = []
+            index = 0
+
+            for part in chapter_splits:
+
+                if re.match(r"(CHAPTER\s+\d+|Chapter\s+\d+|##\s+Chapter.*)", part):
+
+                    if buffer:
+                        segments.append({
+                            "segment_index": index,
+                            "label": current_label or f"Segment {index}",
+                            "content": "\n".join(buffer)
+                        })
+                        index += 1
+                        buffer = []
+                    current_label = part.strip()
+
+                else:
+                    buffer.append(part)
+
+            if buffer:
+                segments.append({
+                    "segment_index": index,
+                    "label": current_label or f"Segment {index}",
+                    "content": "\n".join(buffer)
+                })
+            return segments
+
+        # Fallback: word-based segmentation
+        words = text.split()
+        chunk_size = 2000
+        index = 0
+
+        for i in range(0, len(words), chunk_size):
+            chunk = " ".join(words[i:i+chunk_size])
+            segments.append({
+                "segment_index": index,
+                "label": f"Segment {index}",
+                "content": chunk
+            })
+            index += 1
+        return segments
+
+
+    def _extract_book_metadata(self, file_path: str, text_sample: str) -> dict:
+
+        prompt = (
+            "You are analyzing a book or large text file.\n"
+            f"File path: {file_path}\n\n"
+            f"Sample content:\n{text_sample[:8000]}\n\n"
+            "Tasks:\n"
+            "- Infer the book title if possible (title).\n"
+            "- Infer the author if possible (author).\n"
+            "- Extract the author and book title from file name if possible.\n"
+            "- Classify genre as 'fiction' or 'nonfiction'.\n"
+            "- If unsure, guess based on style.\n"
+            "Return JSON ONLY with keys: title, author, genre."
+        )
+
+        try:
+            raw = self.llm.query(prompt, llm="mistral", persona={"name": "BookMeta"})
+            data = json.loads(raw)
+
+        except Exception as e:
+            self.log(f"⚠️ Book metadata extraction failed for {file_path}: {e}")
+            data = {}
+
+        title = data.get("title") or ""
+        author = data.get("author") or "Unknown"
+        genre = data.get("genre", "").lower()
+
+        if genre not in ("fiction", "nonfiction"):
+            genre = "fiction" if "story" in text_sample.lower() or "chapter" in text_sample.lower() else "nonfiction"
+
+        return {"title": title, "author": author, "genre": genre}
+
+
+    def process_book(self, agent_name: str, file_path: str, content: str) -> dict:
+
+        filename = os.path.basename(file_path)
+        meta = self._extract_book_metadata(file_path, content)
+        title = meta["title"] or os.path.splitext(filename)[0]
+        author = meta["author"]
+        genre = meta["genre"]  # 'fiction' or 'nonfiction'
+        book_folder = self._book_folder(agent_name, title, filename)
+        segments = self._segment_text(content)
+        segment_results = []
+        full_summary_parts = []
+        full_glyphs = []
+
+        for seg in segments:
+            seg_file = book_folder / f"segment_{seg['segment_index']}.txt"
+
+            try:
+
+                with open(seg_file, "w", encoding="utf-8") as f:
+                    f.write(seg["content"])
+
+            except Exception as e:
+                self.log(f"⚠️ Failed to write segment file {seg_file}: {e}")
+
+            seg_prompt = (
+                "You are analyzing a segment of a larger text (book or document).\n"
+                f"Book title (if known): {title}\n"
+                f"Segment label: {seg['label']}\n"
+                f"Segment index: {seg['segment_index']}\n\n"
+                f"Content:\n{seg['content'][:8000]}\n\n"
+                "Tasks:\n"
+                "- Summarize this segment in 3–10 sentences (summary).\n"
+                "- Produce a glyphic memory string (emojis only) representing the meaning (glyphic_memory).\n"
+                "- If any code appears, extract code blocks with:\n"
+                "  - language\n"
+                "  - purpose (one sentence)\n"
+                "  - content (the code).\n"
+                "Return JSON ONLY with keys: summary, glyphic_memory, code_blocks."
+            )
+            mistral_data, localai_data = {}, {}
+
+            try:
+                m_raw = self.llm.query(seg_prompt, llm="mistral", persona={"name": "BookSeg-Mistral"})
+                mistral_data = json.loads(m_raw)
+
+            except Exception as e:
+                self.log(f"⚠️ Mistral segment analysis failed for {file_path} [{seg['label']}]: {e}")
+
+            try:
+                l_raw = self.llm.query(seg_prompt, llm="localai", persona={"name": "BookSeg-LocalAI"})
+                localai_data = json.loads(l_raw)
+
+            except Exception as e:
+                self.log(f"⚠️ LocalAI segment analysis failed for {file_path} [{seg['label']}]: {e}")
+
+            summary_parts = []
+
+            for d in (mistral_data, localai_data):
+
+                if d.get("summary"):
+                    summary_parts.append(d["summary"])
+
+            seg_summary = " ".join(summary_parts)[:4000] if summary_parts else f"Segment {seg['label']} of book {title}."
+            seg_glyph = ""
+
+            for d in (mistral_data, localai_data):
+                g = d.get("glyphic_memory")
+
+                if g:
+                    seg_glyph += g
+
+            if not seg_glyph:
+                seg_glyph = "📘"
+
+            code_blocks = []
+
+            for d in (mistral_data, localai_data):
+                blocks = d.get("code_blocks") or []
+
+                for b in blocks:
+                    lang = b.get("language", "unknown")
+                    purpose = b.get("purpose", "").strip() or f"{lang} code block from {title}"
+                    content_block = b.get("content", "")
+                    code_blocks.append({
+                        "language": lang,
+                        "purpose": purpose,
+                        "content": content_block
+                    })
+
+            segment_results.append({
+                "segment_index": seg["segment_index"],
+                "label": seg["label"],
+                "summary": seg_summary,
+                "glyphic_memory": seg_glyph,
+                "code_blocks": code_blocks
+            })
+            full_summary_parts.append(f"{seg['label']}:\n{seg_summary}\n")
+            full_glyphs.append(seg_glyph)
+
+        full_summary = "\n".join(full_summary_parts)
+        full_glyphic = "".join(full_glyphs)[:128]
+        summary_file = book_folder / "summary.txt"       
+
+        try:     # Write summary.txt
+
+            with open(summary_file, "w", encoding="utf-8") as f:
+                f.write(f"Title: {title}\n")
+                f.write(f"Author: {author}\n")
+                f.write(f"Genre: {genre}\n")
+                f.write(f"Source: {file_path}\n")
+                f.write(f"Date Summarized: {datetime.utcnow().isoformat()}Z\n\n")
+                f.write(full_summary)
+
+        except Exception as e:
+            self.log(f"⚠️ Failed to write summary.txt for {title}: {e}")
+      
+        for seg in segments:   # Delete segment files
+            seg_file = book_folder / f"segment_{seg['segment_index']}.txt"
+
+            try:
+
+                if seg_file.exists():
+                    seg_file.unlink()
+
+            except Exception as e:
+                self.log(f"⚠️ Failed to delete segment file {seg_file}: {e}")
+
+        book_entry = {
+            "Book": title,
+            "Author": author,
+            "Date_Summarized": datetime.utcnow().isoformat() + "Z",
+            "Summary": full_summary,
+            "Glyphic_Memory": full_glyphic,
+            "Location": file_path,
+            "Segments": segment_results
+        }
+
+        return {
+            "genre": genre,          # 'fiction' or 'nonfiction'
+            "book_entry": book_entry,
+            "segments": segment_results,
+            "glyphic_memory": full_glyphic,
+            "summary": full_summary
+        }
+
